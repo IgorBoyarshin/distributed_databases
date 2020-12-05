@@ -1,0 +1,15 @@
+[package]
+name = "distributed_databased"
+version = "0.1.0"
+authors = ["Igor Boyarshin <igor.boyarshin@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+# mongodb = { version = "1.1.1", default-features = false, features = ["tokio-runtime"] }
+mongodb = { version = "1.1.1", default-features = false, features = ["async-std-runtime"] }
+tokio = {"version"= "0.3.5", features=["full"]}
+futures-util = "0.3.8"
+
+[dependencies.serde]
+version = "1.0.111"
+features = ["derive"]
