@@ -9,18 +9,6 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 
-
-#[derive(Deserialize, Serialize)]
-struct Pet {
-    // "type" is a reserved Rust keyword, so instead of naming our 
-    // struct field that, we use serde’s `rename` functionality to 
-    // specify it as the name to use when serializing and 
-    // deserializing.
-    #[serde(rename = "type")]
-    pet_type: String,
-    name: String,
-}
-
 async fn list_databases_and_their_collections(client: &Client) -> Result<()> {
     println!("Databases and their collections:");
     for db_name in client.list_database_names(None, None).await? {
@@ -34,54 +22,131 @@ async fn list_databases_and_their_collections(client: &Client) -> Result<()> {
 }
 
 
+async fn print_collection(collection: &mongodb::Collection) -> Result<()> {
+    let mut cursor = collection.find(None, None).await?;
+    println!("The collection:");
+    // This approach queries in batches
+    while let Some(document) = cursor.next().await {
+        println!("{:#?}", document?);
+        println!();
+    }
+    Ok(())
+}
+
+async fn delete_database(database: &mongodb::Database) -> Result<()> {
+    database.drop(None).await?;
+    Ok(())
+}
+
+async fn delete_collection(collection: &mongodb::Collection) -> Result<()> {
+    collection.drop(None).await?;
+    Ok(())
+}
+
+async fn dump_db(db: &mongodb::Database) -> Result<()> {
+    println!("======== DUMP Start ========");
+    for collection_name in db.list_collection_names(None).await? {
+        println!(">>{}", collection_name);
+        let mut cursor = db.collection(&collection_name).find(None, None).await?;
+        while let Some(document) = cursor.next().await {
+            println!("\t{:#?}", document?);
+            println!();
+        }
+    }
+    println!("======== DUMP End ========");
+    println!();
+    Ok(())
+}
+
+async fn dump(db: &mongodb::Database) -> Result<()> {
+    println!("======== Pretty DUMP Start ========");
+    for collection_name in db.list_collection_names(None).await? {
+        println!(">>{}", collection_name);
+        let mut cursor = db.collection(&collection_name).find(None, None).await?;
+        while let Some(document) = cursor.next().await {
+            let UserData { name, .. }: UserData = bson::from_bson(Bson::Document(document?))?;
+            println!("\tBLOB of size {}", name);
+        }
+    }
+    println!("======== Pretty DUMP End ========");
+    println!();
+    Ok(())
+}
+
+
+fn bytes_to_human(mut size: u32) -> String {
+    if size < 1024 { return size.to_string() + " B"; }
+
+    let mut letter_index = 0;
+    let mut full;
+    loop {
+        full = size / 1024;
+        if full < 1024 { break; }
+        letter_index += 1;
+        size /= 1024;
+    }
+
+    let mut string = full.to_string();
+    let remainder = size % 1024;
+    if remainder != 0 {
+        string += ".";
+        string += &(remainder * 10 / 1024).to_string();
+    }
+    string += " ";
+
+    string += "KMG".get(letter_index..letter_index+1).expect("Size too large");
+    string += "B";
+    string
+}
+
+
+
+
+
+#[derive(Deserialize, Serialize)]
+struct UserData {
+    name: String,
+    size_bytes: u32,
+    content: Vec<u32>,
+}
+
+fn user_data_to_doc(UserData {name, size_bytes, content}: UserData) -> bson::Document {
+    doc! { "name": name, "size_bytes": size_bytes, "content": content }
+}
+
+async fn add_data(collection: &mongodb::Collection, data: UserData) -> Result<()> {
+    collection.insert_one(user_data_to_doc(data), None).await?;
+    Ok(())
+}
+
+fn create_user_data(size_4_bytes: u32) -> UserData {
+    UserData {
+        name: bytes_to_human(size_4_bytes * 4),
+        size_bytes: size_4_bytes * 4,
+        content: vec![25; size_4_bytes as usize],
+    }
+}
+
+
+
+
+
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = Client::with_uri_str(env::var("MONGODB_URI").expect("You must set the MONGODB_URI environment var!").as_ref()).await?;
 
-    list_databases_and_their_collections(&client).await?;
-    println!();
+    // let db = client.database("users");
+    // let collection = db.collection("alex");
+    // delete_collection(&collection).await?;
 
-    let db = client.database("wild_beaver_db"); // will create if does not exist
-    let collection = db.collection("wild_beaver_collection"); // will create if does not exist
+    let db = client.database("users");
+    let collection = db.collection("alex");
 
-    //
-    // Insert stuff(will create duplicates each time the code is run)
-    //
+    add_data(&collection, create_user_data(15 * 1024)).await?;
 
-    // let new_pets = vec![
-    //     doc! { "type": "dog", "name": "Rondo" },
-    //     doc! { "type": "cat", "name": "Smokey" },
-    //     doc! { "type": "cat", "name": "Phil" }, 
-    // ];
-    // collection.insert_many(new_pets, None).await?;
-
-
-    //
-    // Query stuff
-    //
-
-    // Specify the pattern or leave as None to select everything:
-    let cursor = collection.find(None, None).await?;
-    // let mut cursor = collection.find(doc! { "type": "cat" }, None).await?;
-    println!("All the pets:");
-    // This approach collects everything first, and then processes
-    let results: Vec<Result<Document>> = cursor.collect().await;
-    for document in results {
-        // Can convert into the proper type, since we know it (Pet)
-        let pet: Pet = bson::from_bson(Bson::Document(document?))?;
-        println!("There is a {} named {}", pet.pet_type, pet.name);
-    }
-    println!();
-
-    let mut cursor = collection.find(None, None).await?;
-    println!("All the pets (second):");
-    // This approach queries in batches
-    while let Some(document) = cursor.next().await {
-        // Can convert into the proper type, since we know it (Pet)
-        let pet: Pet = bson::from_bson(Bson::Document(document?))?;
-        println!("There is a {} named {}", pet.pet_type, pet.name);
-    }
+    dump(&db).await?;
 
     Ok(())
 }
