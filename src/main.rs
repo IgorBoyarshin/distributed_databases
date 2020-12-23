@@ -129,24 +129,29 @@ fn create_user_data(size_4_bytes: u32) -> UserData {
 
 
 
-
-
-
+async fn stuff(client: &Client) -> Result<()> {
+    let db = client.database("users");
+    let collection= db.collection("joe");
+    add_data(&collection, create_user_data(11 * 1024)).await?;
+    add_data(&collection, create_user_data(22 * 1024)).await?;
+    add_data(&collection, create_user_data(33 * 1024)).await?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::with_uri_str(env::var("MONGODB_URI").expect("You must set the MONGODB_URI environment var!").as_ref()).await?;
+    let client_maple = Client::with_uri_str(env::var("MONGO_MAPLE").expect("You must set the MONGO_<NAME> environment var!").as_ref()).await?;
+    let client_lemon = Client::with_uri_str(env::var("MONGO_LEMON").expect("You must set the MONGO_<NAME> environment var!").as_ref()).await?;
+    let client_christmas = Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("You must set the MONGO_<NAME> environment var!").as_ref()).await?;
+    let client_orange = Client::with_uri_str(env::var("MONGO_ORANGE").expect("You must set the MONGO_<NAME> environment var!").as_ref()).await?;
 
-    // let db = client.database("users");
-    // let collection = db.collection("alex");
-    // delete_collection(&collection).await?;
-
-    let db = client.database("users");
-    let collection = db.collection("alex");
-
-    add_data(&collection, create_user_data(15 * 1024)).await?;
-
-    dump(&db).await?;
+    // stuff(&client_lemon).await?;
+    // stuff(&client_christmas).await?;
+    // stuff(&client_orange).await?;
+    dump(&client_maple.database("users")).await?;
+    dump(&client_orange.database("users")).await?;
+    dump(&client_lemon.database("users")).await?;
+    dump(&client_christmas.database("users")).await?;
 
     Ok(())
 }
