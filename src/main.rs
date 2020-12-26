@@ -233,6 +233,10 @@ struct Operation {
 }
 
 impl Operation {
+    async fn perform_fake(&self, _collection: &mongodb::Collection) -> Result<()>{
+        Ok(())
+    }
+
     async fn perform(&self, collection: &mongodb::Collection) -> Result<()>{
         match self.operation_type {
             OperationType::Create => create_data(&collection, self.action_time).await?,
@@ -377,7 +381,7 @@ impl Brain {
         let default_entry = self.pick_new_storage(from); // XXX: should be in-place, but the BC complains
         let available_storage_ids = self.storage_ids_for_user_id.entry(id).or_insert(vec![default_entry]).to_vec();
         let selected_client = self.storage_id_to_client(Brain::select_best_from(available_storage_ids, from));
-        operation.perform(&to_collection(selected_client, id)).await?;
+        operation.perform_fake(&to_collection(selected_client, id)).await?;
 
         Ok(())
     }
@@ -432,34 +436,14 @@ async fn main() -> Result<()> {
         vec!["Maple Tree", "Lemon Tree", "Christmas Tree", "Orange Tree"]
     );
 
-    reset(&brain).await?;
-
-    // brain.dump().await?;
+    // reset(&brain).await?;
 
     let requests = create_user_request_stream();
     for request in requests {
         brain.handle_request(request).await?;
     }
 
-    brain.dump().await?;
-
-    // let client_maple     = Client::with_uri_str(env::var("MONGO_MAPLE").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
-    // let client_lemon     = Client::with_uri_str(env::var("MONGO_LEMON").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
-    // let client_christmas = Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
-    // let client_orange    = Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
-
-    // stuff(&client_lemon).await?;
-    // stuff(&client_christmas).await?;
-    // stuff(&client_orange).await?;
-
-    // delete_database(&client_maple.database("users")).await?;
-    // delete_database(&client_orange.database("users")).await?;
-    // delete_database(&client_lemon.database("users")).await?;
-    // delete_database(&client_christmas.database("users")).await?;
-    // dump(&client_maple.database("users")).await?;
-    // dump(&client_orange.database("users")).await?;
-    // dump(&client_lemon.database("users")).await?;
-    // dump(&client_christmas.database("users")).await?;
+    // brain.dump().await?;
 
     Ok(())
 }
