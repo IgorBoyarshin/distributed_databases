@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use mongodb::{
     bson,
@@ -18,39 +19,39 @@ use rand::Rng;
 use std::collections::HashMap;
 
 
-async fn list_databases_and_their_collections(client: &Client) -> Result<()> {
-    println!("Databases and their collections:");
-    for db_name in client.list_database_names(None, None).await? {
-        println!("{}", db_name);
-        let db = client.database(&db_name);
-        for collection_name in db.list_collection_names(None).await? {
-            println!("\t{}", collection_name);
-        }
-    }
-    Ok(())
-}
+// async fn list_databases_and_their_collections(client: &Client) -> Result<()> {
+//     println!("Databases and their collections:");
+//     for db_name in client.list_database_names(None, None).await? {
+//         println!("{}", db_name);
+//         let db = client.database(&db_name);
+//         for collection_name in db.list_collection_names(None).await? {
+//             println!("\t{}", collection_name);
+//         }
+//     }
+//     Ok(())
+// }
 
 
-async fn print_collection(collection: &mongodb::Collection) -> Result<()> {
-    let mut cursor = collection.find(None, None).await?;
-    println!("The collection:");
-    // This approach queries in batches
-    while let Some(document) = cursor.next().await {
-        println!("{:#?}", document?);
-        println!();
-    }
-    Ok(())
-}
+// async fn print_collection(collection: &mongodb::Collection) -> Result<()> {
+//     let mut cursor = collection.find(None, None).await?;
+//     println!("The collection:");
+//     // This approach queries in batches
+//     while let Some(document) = cursor.next().await {
+//         println!("{:#?}", document?);
+//         println!();
+//     }
+//     Ok(())
+// }
 
-async fn delete_database(database: &mongodb::Database) -> Result<()> {
-    database.drop(None).await?;
-    Ok(())
-}
+// async fn delete_database(database: &mongodb::Database) -> Result<()> {
+//     database.drop(None).await?;
+//     Ok(())
+// }
 
-async fn delete_collection(collection: &mongodb::Collection) -> Result<()> {
-    collection.drop(None).await?;
-    Ok(())
-}
+// async fn delete_collection(collection: &mongodb::Collection) -> Result<()> {
+//     collection.drop(None).await?;
+//     Ok(())
+// }
 
 // async fn dump_db(db: &mongodb::Database) -> Result<()> {
 //     println!("======== DUMP Start ========");
@@ -90,13 +91,16 @@ async fn dump(client: &Client) -> Result<()> {
     let db = client.database("users");
     for collection_name in db.list_collection_names(None).await? {
         println!(">>{}", collection_name);
-        let mut cursor = db.collection(&collection_name).find(None, None).await?;
-        while let Some(document) = cursor.next().await {
-            let user_data = bson::from_bson(Bson::Document(document?))?;
-            print!("\t");
-            dump_user_data(user_data);
-            println!();
-        }
+        let cursor = db.collection(&collection_name).find(None, None).await?;
+        let entries: Vec<_> = cursor.collect().await;
+        println!("<<{} entries>>", entries.len());
+        // let mut cursor = db.collection(&collection_name).find(None, None).await?;
+        // while let Some(document) = cursor.next().await {
+        //     let user_data = bson::from_bson(Bson::Document(document?))?;
+        //     print!("\t");
+        //     dump_user_data(user_data);
+        //     println!();
+        // }
     }
     println!();
     Ok(())
@@ -283,10 +287,11 @@ fn create_user_request_batch(amount: usize, id: UserId, from: Location, start_ti
 fn create_user_request_stream() -> Vec<UserRequest> {
     let mut stream = Vec::with_capacity(64);
 
+    let max_id = 16;
+    let id = rand::thread_rng().gen_range(1..=max_id);
     let mut time = 1;
     {
         let amount = 10;
-        let id = 1;
         let start_time = time;
         let location = Location::Tokyo;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
@@ -294,7 +299,6 @@ fn create_user_request_stream() -> Vec<UserRequest> {
     }
     {
         let amount = 3;
-        let id = 1;
         let start_time = time;
         let location = Location::Belgium;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
@@ -302,7 +306,6 @@ fn create_user_request_stream() -> Vec<UserRequest> {
     }
     {
         let amount = 5;
-        let id = 1;
         let start_time = time;
         let location = Location::Virginia;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
@@ -310,7 +313,6 @@ fn create_user_request_stream() -> Vec<UserRequest> {
     }
     {
         let amount = 2;
-        let id = 1;
         let start_time = time;
         let location = Location::Tokyo;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
@@ -334,9 +336,9 @@ impl Brain {
         &self.clients[id]
     }
 
-    fn get(&self, id: usize) -> &Client {
-        self.storage_id_to_client(id)
-    }
+    // fn get(&self, id: usize) -> &Client {
+    //     self.storage_id_to_client(id)
+    // }
 
     async fn dump(&self) -> Result<()> {
         for (i, client) in self.clients.iter().enumerate() {
@@ -348,22 +350,60 @@ impl Brain {
         Ok(())
     }
 
-    fn new(clients: Vec<Client>, names: Vec<&'static str>) -> Brain {
-        Brain {
+    async fn collect_storage_ids_for_user_id(clients: &Vec<Client>, names: &Vec<&'static str>) -> Result<HashMap<UserId, Vec<usize>>> {
+        let mut map = HashMap::new();
+        for (i, client) in clients.iter().enumerate() {
+            let user_ids: Vec<UserId> = client.database("users")
+                .list_collection_names(None).await?
+                .into_iter()
+                .map(|user_str| user_str
+                    .strip_prefix("user")
+                    .expect("Collection name didn't start with 'user'")
+                    .parse::<UserId>()
+                    .expect("Failed to parse UserId from Collectio name"))
+                // .for_each(|user_id| map.entry(user_id).or_insert(Vec::new()).push(i))
+                .collect();
+
+            for &id in user_ids.iter() {
+                map.entry(id).or_insert(Vec::new()).push(i);
+            }
+
+            println!("Client {} contains user ids={:?}", names[i], user_ids);
+        }
+        println!("The final map:{:?}", map);
+        Ok(map)
+    }
+
+    async fn new(clients: Vec<Client>, names: Vec<&'static str>) -> Result<Brain> {
+        let storage_ids_for_user_id = Brain::collect_storage_ids_for_user_id(&clients, &names).await?;
+        Ok(Brain {
             clients,
             names,
-            storage_ids_for_user_id: HashMap::new(),
-        }
+            storage_ids_for_user_id,
+            // storage_ids_for_user_id: HashMap::new(),
+        })
     }
 
     // TODO: account for FromLocation when picking
-    fn pick_new_storage(&self, _from: Location) -> usize {
+    async fn pick_new_storage(&self, _from: Location) -> Result<usize> {
+        let mut min_index = 0;
+        let mut min = usize::MAX;
+        for (i, client) in self.clients.iter().enumerate() {
+            let users = client.database("users").list_collection_names(None).await?.len();
+            if users < min {
+                min_index = i;
+                min = users;
+            }
+        }
+        println!("\tThe storage with minimum users is {}(with {} users)", self.names[min_index], min);
+        Ok(min_index)
+
         // Treat all as equal for now
-        rand::thread_rng().gen_range(0..(self.clients.len()))
+        // rand::thread_rng().gen_range(0..(self.clients.len()))
     }
 
     // TODO: account for FromLocation when selecting alternatives
-    fn select_best_from(storages: Vec<usize>, _from: Location) -> usize {
+    fn select_best_from(storages: &Vec<usize>, _from: Location) -> usize {
         // Select randomly first for now
         storages[0]
     }
@@ -378,10 +418,22 @@ impl Brain {
         println!(":> Handling {:?}", &user_request);
         // let available = self.available_storage_ids(id, from);
 
-        let default_entry = self.pick_new_storage(from); // XXX: should be in-place, but the BC complains
-        let available_storage_ids = self.storage_ids_for_user_id.entry(id).or_insert(vec![default_entry]).to_vec();
-        let selected_client = self.storage_id_to_client(Brain::select_best_from(available_storage_ids, from));
-        operation.perform_fake(&to_collection(selected_client, id)).await?;
+        // let available_storage_ids = self.storage_ids_for_user_id.entry(id).or_insert(vec![default_entry]).to_vec();
+        if !self.storage_ids_for_user_id.contains_key(&id) {
+            let first_home = self.pick_new_storage(from).await?; // XXX: should be in-place, but the BC complains
+            println!("\tThis is a new user, selecting storage {} for it", self.names[first_home]);
+            self.storage_ids_for_user_id.insert(id, vec![first_home]);
+        }
+        let available_storage_ids = self.storage_ids_for_user_id.get(&id).unwrap();
+        // println!("\tThere are {} storage variants for this request: {:?}", available_storage_ids.len(), available_storage_ids);
+        let names = available_storage_ids.iter().map(|&id| self.names[id]).collect::<Vec<_>>();
+        println!("\tThere are {} storage variants for this request: {:?}", available_storage_ids.len(), names);
+        let selected_client_id = Brain::select_best_from(available_storage_ids, from);
+        // println!("\tSelecting variant id={}", selected_client_id);
+        println!("\tSelecting variant {}", self.names[selected_client_id]);
+        let selected_client = self.storage_id_to_client(selected_client_id);
+        operation.perform(&to_collection(selected_client, id)).await?;
+        // operation.perform_fake(&to_collection(selected_client, id)).await?;
 
         Ok(())
     }
@@ -434,7 +486,7 @@ async fn main() -> Result<()> {
         Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
         ],
         vec!["Maple Tree", "Lemon Tree", "Christmas Tree", "Orange Tree"]
-    );
+    ).await?;
 
     // reset(&brain).await?;
 
@@ -443,7 +495,7 @@ async fn main() -> Result<()> {
         brain.handle_request(request).await?;
     }
 
-    // brain.dump().await?;
+    brain.dump().await?;
 
     Ok(())
 }
