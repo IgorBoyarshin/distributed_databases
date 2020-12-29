@@ -91,16 +91,18 @@ async fn dump(client: &Client) -> Result<()> {
     let db = client.database("users");
     for collection_name in db.list_collection_names(None).await? {
         println!(">>{}", collection_name);
-        let cursor = db.collection(&collection_name).find(None, None).await?;
-        let entries: Vec<_> = cursor.collect().await;
-        println!("<<{} entries>>", entries.len());
-        // let mut cursor = db.collection(&collection_name).find(None, None).await?;
-        // while let Some(document) = cursor.next().await {
-        //     let user_data = bson::from_bson(Bson::Document(document?))?;
-        //     print!("\t");
-        //     dump_user_data(user_data);
-        //     println!();
-        // }
+
+        // let cursor = db.collection(&collection_name).find(None, None).await?;
+        // let entries: Vec<_> = cursor.collect().await;
+        // println!("<<{} entries>>", entries.len());
+
+        let mut cursor = db.collection(&collection_name).find(None, None).await?;
+        while let Some(document) = cursor.next().await {
+            let user_data = bson::from_bson(Bson::Document(document?))?;
+            print!("\t");
+            dump_user_data(user_data);
+            println!();
+        }
     }
     println!();
     Ok(())
@@ -188,20 +190,29 @@ enum Location {
 
 
 async fn create_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
-    // TODO: create more personalized data. Also: use some ids for data to be able to modify it
-    // later
     let size = 15 * 1024;
     let data = create_user_data(size, time);
     add_data(&collection, data).await?;
     Ok(())
 }
 
-async fn delete_data(_collection: &mongodb::Collection, _time: Time) -> Result<()>{
-    // TODO
-    // TODO
-    // TODO
+async fn delete_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
+    collection.delete_many(doc!{ "created_at": time }, None).await?;
     Ok(())
 }
+
+async fn read_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
+    collection.find_one(doc!{ "created_at": time }, None).await?;
+    Ok(())
+}
+
+async fn update_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
+    let size = 10 * 1024;
+    let data = user_data_to_doc(create_user_data(size, time + 10));
+    collection.replace_one(doc!{ "created_at": time }, data, None).await?;
+    Ok(())
+}
+
 
 
 
@@ -212,21 +223,14 @@ enum OperationType {
 
 impl OperationType {
     fn random() -> OperationType {
-        // TODO
-        // TODO
-        // TODO
-        // TODO
-        // TODO
-        // TODO
-        OperationType::Create
-        // let mut rng = rand::thread_rng();
-        // match rng.gen_range(0..4) {
-        //     0 => OperationType::Create,
-        //     1 => OperationType::Read,
-        //     2 => OperationType::Update,
-        //     3 => OperationType::Delete,
-        //     _ => panic!("Invalid range generated for OperationType"),
-        // }
+        let mut rng = rand::thread_rng();
+        match rng.gen_range(0..4) {
+            0 => OperationType::Create,
+            1 => OperationType::Read,
+            2 => OperationType::Update,
+            3 => OperationType::Delete,
+            _ => panic!("Invalid range generated for OperationType"),
+        }
     }
 }
 
@@ -244,8 +248,9 @@ impl Operation {
     async fn perform(&self, collection: &mongodb::Collection) -> Result<()>{
         match self.operation_type {
             OperationType::Create => create_data(&collection, self.action_time).await?,
+            OperationType::Read => read_data(&collection, self.action_time).await?,
+            OperationType::Update => update_data(&collection, self.action_time).await?,
             OperationType::Delete => delete_data(&collection, self.action_time).await?,
-            _ => println!("No-op for perform()"),
         }
         Ok(())
     }
