@@ -336,7 +336,8 @@ fn create_user_request_stream() -> Vec<UserRequest> {
     let mut stream = Vec::with_capacity(64);
 
     let max_id = 8;
-    let id = rand::thread_rng().gen_range(1..=max_id);
+    let id = 3;
+    // let id = rand::thread_rng().gen_range(1..=max_id);
     let mut time = 1;
     {
         let amount = 3;
@@ -509,14 +510,40 @@ impl Brain {
         Ok(map)
     }
 
+    // TODO: copy-pasted and modified from collect_storage_ids_for_user_id
+    // TODO: can merge.....
+    async fn initialize_history(clients: &Vec<Client>) -> Result<HashMap<UserId, Vec<StorageId>>> {
+        let mut map = HashMap::new();
+        for client in clients.iter() {
+            let user_ids: Vec<UserId> = client.database("users")
+                .list_collection_names(None).await?
+                .into_iter()
+                .map(|user_str| user_str
+                    .strip_prefix("user")
+                    .expect("Collection name didn't start with 'user'")
+                    .parse::<UserId>()
+                    .expect("Failed to parse UserId from Collectio name"))
+                .collect();
+
+            for id in user_ids.into_iter() {
+                map.entry(id).or_insert(Vec::new());
+            }
+        }
+
+        println!("Final known IDs for history:{:?}", map.keys());
+        Ok(map)
+    }
+
     async fn new(clients: Vec<Client>, names: Vec<&'static str>) -> Result<Brain> {
-        // let storage_ids_for_user_id = Brain::collect_storage_ids_for_user_id(&clients, &names).await?;
+        let storage_ids_for_user_id = Brain::collect_storage_ids_for_user_id(&clients, &names).await?;
+        let history = Brain::initialize_history(&clients).await?;
         Ok(Brain {
             clients,
             names,
-            storage_ids_for_user_id: HashMap::new(),
-            // storage_ids_for_user_id,
-            history: HashMap::new(),
+            // storage_ids_for_user_id: HashMap::new(),
+            storage_ids_for_user_id,
+            // history: HashMap::new(),
+            history,
         })
     }
 
