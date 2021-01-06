@@ -302,7 +302,9 @@ struct UserRequest {
 
 impl UserRequest {
     fn new(id: UserId, from: Location, time: Time) -> UserRequest {
-        let operation = Operation::new(OperationType::random(), time);
+        let max_action_time = 10;
+        let action_time = rand::thread_rng().gen_range(1..=max_action_time);
+        let operation = Operation::new(OperationType::random(), action_time);
         UserRequest{ id, from, operation, time }
     }
 }
