@@ -388,18 +388,26 @@ struct Brain {
 }
 
 impl Brain {
+    fn only_one_storage_for(&self, user_id: UserId) -> bool {
+        self.storage_ids_for_user_id.get(&user_id)
+            .expect(&format!("Uninitialized user {} in storage_ids_for_user_id", user_id))
+            .len() <= 1
+    }
+
     fn rule_time_to_delete_storage_for(&self, storage_id: StorageId, user_id: UserId) -> bool {
         let threshold = 8;
         let mut foreign_counter = 0;
         let history = self.history.get(&user_id).expect(&format!("Uninitialized user {} in history", user_id));
         for &target in history {
             if target == storage_id {
-                // There WAS a request for storage_id during last THRESHOLD queries
+                // println!("\t[RULE Delete] For {} there WAS a request to {} during last {} queries. Will NOT delete.",
+                //     user_id, self.names[storage_id], threshold);
                 return false;
             }
             foreign_counter += 1;
             if foreign_counter >= threshold {
-                // Have not encountered a request for storage_id during last THRESHOLD queries
+                println!("\t[RULE Delete] For {} there was NOT a request to {} during last {} queries. WILL delete.",
+                    user_id, self.names[storage_id], threshold);
                 return true;
             }
         }
@@ -426,14 +434,15 @@ impl Brain {
                 amount += 1;
             }
             if amount >= amount_threshold {
-                println!("\tFor {} there WAS enough({}) requests to {} during last {} queries. Will allocate.",
+                println!("\t[RULE Allocate] For {} there WAS enough({}) requests to {} during last {} queries. Will allocate.",
                     user_id, amount_threshold, self.names[storage_id], depth_threshold);
                 return true;
             }
 
+            // TODO: don't hit this one
             depth += 1;
             if depth >= depth_threshold {
-                println!("\tFor {} there was NOT enough({}) requests to {} during last {} queries.",
+                println!("\t[RULE Allocate] For {} there was NOT enough({}) requests to {} during last {} queries.",
                     user_id, amount_threshold, self.names[storage_id], depth_threshold);
                 return false;
             }
@@ -663,18 +672,17 @@ impl Brain {
         self.history.get_mut(&user_id).expect(&format!("Uninitialized user {}", user_id)).push(loc);
 
         // Apply rules
-        for storage_id in available_storage_ids.clone() { // clone() used for BC
-            // The rules are mutually exclusive
-
-            if self.rule_time_to_delete_storage_for(storage_id, user_id) {
-                println!("\t\t[RULE]: time to delete storage {} for this user ({})", self.names[storage_id], user_id);
-                self.delete_storage_for_user(storage_id, user_id).await?;
+        if !self.only_one_storage_for(user_id) {
+            for storage_id in available_storage_ids.clone() { // clone() used for BC
+                if self.rule_time_to_delete_storage_for(storage_id, user_id) {
+                    println!("\t\t[RULE Delete]: time to delete storage {} for this user ({})", self.names[storage_id], user_id);
+                    self.delete_storage_for_user(storage_id, user_id).await?;
+                }
             }
         }
-
         for storage_id in 0..4 { // clone() used for BC
             if self.rule_time_to_allocate_storage_for(storage_id, user_id) {
-                println!("\t\t[RULE]: time to allocate storage {} for this user ({})", self.names[storage_id], user_id);
+                println!("\t\t[RULE Allocate]: time to allocate storage {} for this user ({})", self.names[storage_id], user_id);
                 self.allocate_storage_for_user(storage_id, user_id).await?;
             }
         }
