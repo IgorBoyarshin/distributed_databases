@@ -216,6 +216,19 @@ enum Location {
     Virginia, Belgium, Ireland, Tokyo
 }
 
+impl Location {
+    fn random() -> Location {
+        let mut rng = rand::thread_rng();
+        match rng.gen_range(0..4) {
+            0 => Location::Virginia,
+            1 => Location::Belgium,
+            2 => Location::Ireland,
+            3 => Location::Tokyo,
+            _ => panic!("Invalid range generated for Location"),
+        }
+    }
+}
+
 
 async fn create_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
     let size = 15 * 1024;
@@ -325,38 +338,35 @@ fn create_user_request_stream() -> Vec<UserRequest> {
     let max_id = 8;
     let id = rand::thread_rng().gen_range(1..=max_id);
     let mut time = 1;
-    // {
-    //     let amount = 10;
-    //     let start_time = time;
-    //     let location = Location::Tokyo;
-    //     stream.append(&mut create_user_request_batch(amount, id, location, start_time));
-    //     time += amount as Time;
-    // }
     {
         let amount = 3;
         let start_time = time;
-        let location = Location::Belgium;
+        let location = Location::random();
+        // let location = Location::Belgium;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
         time += amount as Time;
     }
     {
         let amount = 5;
         let start_time = time;
-        let location = Location::Virginia;
+        let location = Location::random();
+        // let location = Location::Virginia;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
         time += amount as Time;
     }
     {
         let amount = 4;
         let start_time = time;
-        let location = Location::Tokyo;
+        let location = Location::random();
+        // let location = Location::Tokyo;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
         time += amount as Time;
     }
     {
         let amount = 2;
         let start_time = time;
-        let location = Location::Belgium;
+        let location = Location::random();
+        // let location = Location::Belgium;
         stream.append(&mut create_user_request_batch(amount, id, location, start_time));
         // time += amount as Time;
     }
