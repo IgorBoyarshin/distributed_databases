@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 // use futures::future::join_all;
 // use futures::join;
 use futures::try_join;
+use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 
@@ -117,7 +118,7 @@ async fn dump_to_str(client: &Client) -> Result<String> {
     let mut result = String::new();
     let db = client.database("users");
     for collection_name in db.list_collection_names(None).await? {
-        result.push_str(&format!(">>{}", collection_name));
+        result.push_str(&format!(">>{}\n", collection_name));
 
         // let cursor = db.collection(&collection_name).find(None, None).await?;
         // let entries: Vec<_> = cursor.collect().await;
@@ -272,7 +273,7 @@ impl Operation {
         Ok(())
     }
 
-    async fn perform(&self, collection: &mongodb::Collection) -> Result<()>{
+    async fn perform(&self, collection: mongodb::Collection) -> Result<()>{
         match self.operation_type {
             OperationType::Create => create_data(&collection, self.action_time).await?,
             OperationType::Read => read_data(&collection, self.action_time).await?,
@@ -412,14 +413,14 @@ impl Brain {
                 amount += 1;
             }
             if amount >= amount_threshold {
-                println!("\t\tFor {} there WAS enough({}) requests to {} during last {} queries. Will allocate.",
+                println!("\tFor {} there WAS enough({}) requests to {} during last {} queries. Will allocate.",
                     user_id, amount_threshold, self.names[storage_id], depth_threshold);
                 return true;
             }
 
             depth += 1;
             if depth >= depth_threshold {
-                println!("\t\tFor {} there was NOT enough({}) requests to {} during last {} queries.",
+                println!("\tFor {} there was NOT enough({}) requests to {} during last {} queries.",
                     user_id, amount_threshold, self.names[storage_id], depth_threshold);
                 return false;
             }
@@ -573,25 +574,49 @@ impl Brain {
         // Determine the server (Storage) to work with
         let available_storage_ids = self.storage_ids_for_user_id.get(&user_id).unwrap();
         let names = available_storage_ids.iter().map(|&id| self.names[id]).collect::<Vec<_>>();
-        println!("\tThere are {} storage variants for this request: {:?}", available_storage_ids.len(), names);
+        println!("\tThere are {} storage variants for this request: {:?}", names.len(), names);
         let selected_storage_id = self.select_best_from(available_storage_ids, from);
         println!("\tSelecting variant {}", self.names[selected_storage_id]);
 
         // Perform the operation
         let client = self.storage_id_to_client(selected_storage_id);
-        operation.perform(&to_collection(client, user_id)).await?;
+        operation.perform(to_collection(client, user_id)).await?;
+        println!("\tPerforming operation on {}", self.names[selected_storage_id]);
         // operation.perform_fake(&to_collection(client, user_id)).await?;
         // ... and maybe return result to user
         // <<< RETURN RESULT HERE >>>
 
         // Sync across all DBs
-        for &storage_id in available_storage_ids {
-            if storage_id == selected_storage_id {
-                // Have performed this operation on this DB already
-                continue;
+        // Sequential
+        // {
+        //     for &storage_id in available_storage_ids {
+        //         if storage_id == selected_storage_id {
+        //             // Have performed this operation on this DB already
+        //             continue;
+        //         }
+        //         let client = self.storage_id_to_client(storage_id);
+        //         operation.perform(&to_collection(client, user_id)).await?;
+        //     }
+        // }
+        // Parallel
+        {
+            // let mut operations_temp = Vec::new();
+            let mut operations = Vec::new();
+            for &storage_id in available_storage_ids {
+                if storage_id == selected_storage_id {
+                    // Have performed this operation on this DB already
+                    println!("\t\tOperation on {} has already been synced, skipping", self.names[storage_id]);
+                    continue;
+                }
+                println!("\t\tSyncing operation on {}", self.names[storage_id]);
+                let client = self.storage_id_to_client(storage_id);
+                operations.push(operation.perform(to_collection(client, user_id)));
+                // operations_temp.push(to_collection(client, user_id));
             }
-            let client = self.storage_id_to_client(storage_id);
-            operation.perform(&to_collection(client, user_id)).await?;
+            // for collection in operations_temp.into_iter() {
+                // operations.push(operation.perform(collection));
+            // }
+            try_join_all(operations).await?;
         }
 
         // Update history
@@ -603,14 +628,14 @@ impl Brain {
             // The rules are mutually exclusive
 
             if self.rule_time_to_delete_storage_for(storage_id, user_id) {
-                println!("\t[RULE]: time to delete storage {} for this user ({})", self.names[storage_id], user_id);
+                println!("\t\t[RULE]: time to delete storage {} for this user ({})", self.names[storage_id], user_id);
                 self.delete_storage_for_user(storage_id, user_id).await?;
             }
         }
 
         for storage_id in 0..4 { // clone() used for BC
             if self.rule_time_to_allocate_storage_for(storage_id, user_id) {
-                println!("\t[RULE]: time to allocate storage {} for this user ({})", self.names[storage_id], user_id);
+                println!("\t\t[RULE]: time to allocate storage {} for this user ({})", self.names[storage_id], user_id);
                 self.allocate_storage_for_user(storage_id, user_id).await?;
             }
         }
@@ -670,10 +695,10 @@ async fn main() -> Result<()> {
 
     // reset(&brain).await?;
 
-    // let requests = create_user_request_stream();
-    // for request in requests {
-    //     brain.handle_request(request).await?;
-    // }
+    let requests = create_user_request_stream();
+    for request in requests {
+        brain.handle_request(request).await?;
+    }
 
     brain.dump().await?;
 
