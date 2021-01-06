@@ -21,70 +21,6 @@ use rand::Rng;
 use std::collections::HashMap;
 
 
-// async fn list_databases_and_their_collections(client: &Client) -> Result<()> {
-//     println!("Databases and their collections:");
-//     for db_name in client.list_database_names(None, None).await? {
-//         println!("{}", db_name);
-//         let db = client.database(&db_name);
-//         for collection_name in db.list_collection_names(None).await? {
-//             println!("\t{}", collection_name);
-//         }
-//     }
-//     Ok(())
-// }
-
-
-// async fn print_collection(collection: &mongodb::Collection) -> Result<()> {
-//     let mut cursor = collection.find(None, None).await?;
-//     println!("The collection:");
-//     // This approach queries in batches
-//     while let Some(document) = cursor.next().await {
-//         println!("{:#?}", document?);
-//         println!();
-//     }
-//     Ok(())
-// }
-
-// async fn delete_database(database: &mongodb::Database) -> Result<()> {
-//     database.drop(None).await?;
-//     Ok(())
-// }
-
-// async fn delete_collection(collection: &mongodb::Collection) -> Result<()> {
-//     collection.drop(None).await?;
-//     Ok(())
-// }
-
-// async fn dump_db(db: &mongodb::Database) -> Result<()> {
-//     println!("======== DUMP Start ========");
-//     for collection_name in db.list_collection_names(None).await? {
-//         println!(">>{}", collection_name);
-//         let mut cursor = db.collection(&collection_name).find(None, None).await?;
-//         while let Some(document) = cursor.next().await {
-//             println!("\t{:#?}", document?);
-//             println!();
-//         }
-//     }
-//     println!("======== DUMP End ========");
-//     println!();
-//     Ok(())
-// }
-//
-// async fn dump(db: &mongodb::Database) -> Result<()> {
-//     println!("======== Pretty DUMP Start ========");
-//     for collection_name in db.list_collection_names(None).await? {
-//         println!(">>{}", collection_name);
-//         let mut cursor = db.collection(&collection_name).find(None, None).await?;
-//         while let Some(document) = cursor.next().await {
-//             let UserData { name, .. }: UserData = bson::from_bson(Bson::Document(document?))?;
-//             println!("\tBLOB of size {}", name);
-//         }
-//     }
-//     println!("======== Pretty DUMP End ========");
-//     println!();
-//     Ok(())
-// }
-
 fn dump_user_data(UserData{ name, created_at, .. }: UserData) {
     print!("[at: {}, of size: {}]", created_at, name);
 }
@@ -193,17 +129,6 @@ fn create_user_data(size_4_bytes: u32, created_at: Time) -> UserData {
 }
 
 
-
-// async fn stuff(client: &Client) -> Result<()> {
-    // let db = client.database("users");
-    // let collection= db.collection("joe");
-    // add_data(&collection, create_user_data(11 * 1024)).await?;
-    // add_data(&collection, create_user_data(22 * 1024)).await?;
-    // add_data(&collection, create_user_data(33 * 1024)).await?;
-//     Ok(())
-// }
-
-
 fn to_collection(client: &Client, id: UserId) -> mongodb::Collection {
     client.database("users").collection(&format!("user{}", id))
 }
@@ -248,8 +173,9 @@ async fn read_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
 }
 
 async fn update_data(collection: &mongodb::Collection, time: Time) -> Result<()>{
+    // TODO: stay within field for "at"
     let size = 10 * 1024;
-    let data = user_data_to_doc(create_user_data(size, time + 10));
+    let data = user_data_to_doc(create_user_data(size, 10 * time));
     collection.replace_one(doc!{ "created_at": time }, data, None).await?;
     Ok(())
 }
@@ -332,12 +258,12 @@ fn create_user_request_batch(amount: usize, id: UserId, from: Location, start_ti
     batch
 }
 
-fn create_user_request_stream() -> Vec<UserRequest> {
+fn create_manual_user_request_stream() -> Vec<UserRequest> {
     let mut stream = Vec::with_capacity(64);
 
     let max_id = 8;
-    let id = 3;
-    // let id = rand::thread_rng().gen_range(1..=max_id);
+    // let id = 3;
+    let id = rand::thread_rng().gen_range(1..=max_id);
     let mut time = 1;
     {
         let amount = 3;
@@ -375,6 +301,33 @@ fn create_user_request_stream() -> Vec<UserRequest> {
     stream.shrink_to_fit();
     stream
 }
+
+fn create_random_user_request_stream(size: usize) -> Vec<UserRequest> {
+    let mut stream = Vec::with_capacity(size);
+    let mut time = 1;
+
+    let mut location = Location::random();
+
+    let max_amount = 10;
+    let mut amount = rand::thread_rng().gen_range(1..=max_amount);
+
+    let max_id = 8;
+    let mut id = rand::thread_rng().gen_range(1..=max_id);
+
+    for _ in 0..size {
+        stream.push(UserRequest::new(id, location, time));
+
+        amount -= 1;
+        if amount == 0 {
+            location = Location::random();
+            amount = rand::thread_rng().gen_range(1..=max_amount);
+            id = rand::thread_rng().gen_range(1..=max_id);
+        }
+
+        time += 1;
+    }
+    stream
+}
 // ============================================================================
 // ============================================================================
 // ============================================================================
@@ -395,10 +348,10 @@ impl Brain {
     }
 
     fn rule_time_to_delete_storage_for(&self, storage_id: StorageId, user_id: UserId) -> bool {
-        let threshold = 8;
+        let threshold = 10;
         let mut foreign_counter = 0;
         let history = self.history.get(&user_id).expect(&format!("Uninitialized user {} in history", user_id));
-        for &target in history {
+        for &target in history.iter().rev() {
             if target == storage_id {
                 // println!("\t[RULE Delete] For {} there WAS a request to {} during last {} queries. Will NOT delete.",
                 //     user_id, self.names[storage_id], threshold);
@@ -424,26 +377,25 @@ impl Brain {
             return false;
         }
 
-        let depth_threshold = 20;
+        let depth_threshold = 8;
         let amount_threshold = 3;
         let mut amount = 0;
         let mut depth = 0;
         let history = self.history.get(&user_id).expect(&format!("Uninitialized user {} in history", user_id));
-        for &target in history {
+        for &target in history.iter().rev() {
             if target == storage_id {
                 amount += 1;
             }
             if amount >= amount_threshold {
-                println!("\t[RULE Allocate] For {} there WAS enough({}) requests to {} during last {} queries. Will allocate.",
+                println!("\t[RULE Allocate] For {} there WAS enough({}) requests that should have been to {} during last {} queries. Will allocate.",
                     user_id, amount_threshold, self.names[storage_id], depth_threshold);
                 return true;
             }
 
-            // TODO: don't hit this one
             depth += 1;
             if depth >= depth_threshold {
-                println!("\t[RULE Allocate] For {} there was NOT enough({}) requests to {} during last {} queries.",
-                    user_id, amount_threshold, self.names[storage_id], depth_threshold);
+                // println!("\t[RULE Allocate] For {} there was NOT enough({}) requests that should have been to {} during last {} queries.",
+                    // user_id, amount_threshold, self.names[storage_id], depth_threshold);
                 return false;
             }
         }
@@ -453,11 +405,40 @@ impl Brain {
 
     async fn delete_storage_for_user(&mut self, storage_id: StorageId, user_id: UserId) -> Result<()> {
         self.clients[storage_id].database("users").collection(&format!("user{}", user_id)).drop(None).await?;
+        self.storage_ids_for_user_id.get_mut(&user_id)
+            .expect(&format!("Uninitialized user {} in history", user_id))
+            .retain(|&x| x != storage_id);
+
         Ok(())
     }
 
-    async fn allocate_storage_for_user(&mut self, _storage_id: StorageId, _user_id: UserId) -> Result<()> {
-        // let data = self.clients[storage_id].databae
+    async fn allocate_storage_for_user(&mut self, storage_id: StorageId, user_id: UserId) -> Result<()> {
+        println!("\t Allocating storage {} for user {}", storage_id, user_id);
+        // Fetch data from any Storage with this user's data
+        // ...just pick the first for now
+        let storage_id_to_fetch_from = self.storage_ids_for_user_id.get(&user_id)
+            .expect(&format!("Uninitialized user {} in storage_ids_for_user_id", user_id))
+            [0];
+        println!("\t Using {} to transfer from", storage_id_to_fetch_from);
+
+        let user_data = to_collection(&self.clients[storage_id_to_fetch_from], user_id).find(None, None).await?
+            .map(|document| bson::from_bson(Bson::Document(document.expect("Failed to parse user_data"))).expect("Failed to parse user_data"))
+            .collect::<Vec<UserData>>().await;
+        println!("\t Collected {} entries", user_data.len());
+
+        // Transfer this data to the new location
+        if user_data.len() > 0 {
+            to_collection(&self.clients[storage_id], user_id).insert_many(user_data.into_iter().map(user_data_to_doc), None).await?;
+            println!("\tFinished transfering to {}", storage_id);
+        } else {
+            println!("\tNo records exist for this user, so no records will be transfered");
+        }
+
+        // Update records
+        self.storage_ids_for_user_id.get_mut(&user_id)
+            .expect(&format!("Uninitialized user {} in storage_ids_for_user_id", user_id))
+            .push(storage_id);
+
         Ok(())
     }
 
@@ -568,6 +549,16 @@ impl Brain {
         }
     }
 
+    fn storage_id_to_location(&self, storage_id: StorageId) -> Location {
+        match storage_id {
+            0 => Location::Belgium,
+            1 => Location::Virginia,
+            2 => Location::Tokyo,
+            3 => Location::Ireland,
+            _ => panic!("Invalid range for Location"),
+        }
+    }
+
     fn pick_new_storage(&self, from: Location) -> StorageId {
         // Pick Storage with best location
         return self.location_to_storage_id(&from);
@@ -668,25 +659,51 @@ impl Brain {
         }
 
         // Update history
+        // We use _from_ here and not _selected_ because we use this information
+        // to see where the requests are wanting to go, not where we direct them
+        // based on what we currently have
         let loc = self.location_to_storage_id(&from);
         self.history.get_mut(&user_id).expect(&format!("Uninitialized user {}", user_id)).push(loc);
 
         // Apply rules
-        if !self.only_one_storage_for(user_id) {
-            for storage_id in available_storage_ids.clone() { // clone() used for BC
-                if self.rule_time_to_delete_storage_for(storage_id, user_id) {
-                    println!("\t\t[RULE Delete]: time to delete storage {} for this user ({})", self.names[storage_id], user_id);
-                    self.delete_storage_for_user(storage_id, user_id).await?;
-                }
-            }
-        }
         for storage_id in 0..4 { // clone() used for BC
             if self.rule_time_to_allocate_storage_for(storage_id, user_id) {
                 println!("\t\t[RULE Allocate]: time to allocate storage {} for this user ({})", self.names[storage_id], user_id);
                 self.allocate_storage_for_user(storage_id, user_id).await?;
             }
         }
+        if !self.only_one_storage_for(user_id) {
+            let available_storage_ids = self.storage_ids_for_user_id.get(&user_id).unwrap().clone(); // clone for BC
+            for storage_id in available_storage_ids {
+                if self.rule_time_to_delete_storage_for(storage_id, user_id) {
+                    println!("\t\t[RULE Delete]: time to delete storage {} for this user ({})", self.names[storage_id], user_id);
+                    self.delete_storage_for_user(storage_id, user_id).await?;
+                }
+            }
+        }
 
+        Ok(())
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        println!(":> Resetting records");
+        self.storage_ids_for_user_id = HashMap::new();
+        self.history = HashMap::new();
+        // for (i, client) in self.clients.iter().enumerate() {
+        //     println!(":> Resetting {}", self.names[i]);
+        //     client.database("users").drop(None).await?
+        // }
+        println!("Deleting dbs...");
+        let a1 = self.clients[0].database("users");
+        let a2 = self.clients[1].database("users");
+        let a3 = self.clients[2].database("users");
+        let a4 = self.clients[3].database("users");
+        try_join!(
+            a1.drop(None),
+            a2.drop(None),
+            a3.drop(None),
+            a4.drop(None)
+        )?;
         Ok(())
     }
 }
@@ -695,39 +712,9 @@ impl Brain {
 // ============================================================================
 
 
-
-
-
-
-
-
-
-
-
-
-
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn reset(brain: &Brain) -> Result<()> {
-    for (i, client) in brain.clients.iter().enumerate() {
-        println!(":> Resetting {}", brain.names[i]);
-        client.database("users").drop(None).await?
-    }
-    // println!("Deleting dbs...");
-    // let a1 = clients[0].database("users");
-    // let a2 = clients[1].database("users");
-    // let a3 = clients[2].database("users");
-    // let a4 = clients[3].database("users");
-    // try_join!(
-    //     a1.drop(None),
-    //     a2.drop(None),
-    //     a3.drop(None),
-    //     a4.drop(None)
-    // )?;
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut brain = Brain::new(
@@ -737,12 +724,12 @@ async fn main() -> Result<()> {
         Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
         Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
         ],
-        vec!["Maple Tree", "Lemon Tree", "Christmas Tree", "Orange Tree"]
+        vec!["Maple Tree (Belgium)", "Lemon Tree (Virginia)", "Christmas Tree (Tokyo)", "Orange Tree (Ireland)"]
     ).await?;
 
-    // reset(&brain).await?;
+    // brain.reset().await?;
 
-    let requests = create_user_request_stream();
+    let requests = create_random_user_request_stream(128);
     for request in requests {
         brain.handle_request(request).await?;
     }
