@@ -50,23 +50,23 @@ enum UserBehavior {
 }
 
 impl UserBehavior {
-    fn gen(&self, projects: &Vec<ProjectId>) -> (ProjectId, UserBehavior) {
+    fn gen(&mut self, projects: &Vec<ProjectId>) -> ProjectId {
         match self {
-            UserBehavior::AveragedSequential{ mut amount, mut left, mut project_id } => {
+            UserBehavior::AveragedSequential{ amount, left, project_id } => {
                 let max_amount = 10; // @hyper
 
-                if left == 0 {
-                    amount     = rand::thread_rng().gen_range(1..=max_amount);
-                    project_id = projects[rand::thread_rng().gen_range(0..projects.len())];
-                    left       = amount;
+                if *left == 0 {
+                    *amount     = rand::thread_rng().gen_range(1..=max_amount);
+                    *project_id = projects[rand::thread_rng().gen_range(0..projects.len())];
+                    *left       = *amount;
                 }
-                left -= 1;
+                *left -= 1;
 
-                (project_id, UserBehavior::AveragedSequential{ amount, left, project_id })
+                *project_id
             },
             UserBehavior::AveragedRandom => {
                 let project_id = projects[rand::thread_rng().gen_range(0..projects.len())];
-                (project_id, UserBehavior::AveragedRandom)
+                project_id
             },
         }
     }
@@ -105,9 +105,7 @@ impl User {
     // }
 
     fn gen(&mut self) -> ProjectId {
-        let project_id;
-        (project_id, self.user_behavior) = self.user_behavior.gen(&self.projects);
-        project_id
+        self.user_behavior.gen(&self.projects)
     }
 
     fn create_users(users_amount: usize, projects: Vec<ProjectId>) -> Vec<User> {
