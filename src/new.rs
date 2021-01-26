@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
             // Finish simulation?
             if time == simulation_request_count {
                 spawner_tx.send(None).unwrap();
+                break;
             }
         }
     });
