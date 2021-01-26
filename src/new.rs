@@ -209,17 +209,15 @@ async fn main() -> Result<()> {
     let simulation_request_count = 100;
     let projects = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"]; // @hyper
     let projects_count = projects.len();
-    let user_amount = 5; // @hyper
+    let user_amount = 5;
     let mut users = User::create_users(user_amount, projects_count);
 
-    for user in users.iter() {
-        describe_user(&user);
-    }
-
+    for user in users.iter() { describe_user(&user); }
 
 
     let (spawner_tx, spawner_rx) = channel();
-    // Responsible for spawning Tasks
+
+    // Responsible for spawning UserRequests
     thread::spawn(move|| {
         let mut time = 0;
         loop {
@@ -234,7 +232,8 @@ async fn main() -> Result<()> {
             spawner_tx.send(Some(UserRequest{ id: user.id, project_id, time })).unwrap();
 
             // Go to sleep
-            let sleep_duration = request_stream_lambda * 2.71828f32.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
+            let e = 2.71828f32;
+            let sleep_duration = request_stream_lambda * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
             thread::sleep(time::Duration::from_millis(sleep_duration as u64));
             // println!("Sleeping for {}ms...", sleep_duration);
 
@@ -249,9 +248,20 @@ async fn main() -> Result<()> {
     });
 
 
+    // Responsible for processing UserRequests
+    let mut last_at = time::Instant::now();
     loop {
         if let Some(UserRequest{ id, project_id, time }) = spawner_rx.recv().expect("dead spawner_tx channel") {
-            println!("At [{:>3}] got request from {} to project {}", time, id, projects[project_id]);
+            let start = time::Instant::now();
+            print!("[Since last = {:>5} millis]\t", last_at.elapsed().as_millis());
+            last_at = start;
+            print!("At [{:>3}] got request from {} to project {:>16}", time, id, projects[project_id]);
+
+            // Process here
+            thread::sleep(time::Duration::from_millis(1));
+
+            let elapsed_micros = start.elapsed().as_micros();
+            println!("\t[processed in {:>5} micros]", elapsed_micros);
         } else {
             println!(":> Simulation finished (requests stream exhausted)");
             break;
