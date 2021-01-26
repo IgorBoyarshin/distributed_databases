@@ -26,6 +26,9 @@ use rand_distr::{Poisson, Distribution};
 use rand::distributions::Open01;
 
 
+use variant_count::VariantCount;
+
+
 use std::thread;
 use std::time;
 use std::sync::mpsc::channel;
@@ -35,6 +38,7 @@ use std::sync::mpsc::channel;
 
 
 
+#[derive(VariantCount, Debug)]
 enum UserBehavior {
     AveragedSequential {
         amount: u32,
@@ -42,22 +46,25 @@ enum UserBehavior {
         project_id: ProjectId,
     },
     AveragedRandom,
-    // PreferentialMono {
-    //     project_id: ProjectId,
-    // },
-    // PreferentialDuo,
-    // Amount = 2
+    PreferentialMono {
+        project_id: ProjectId,
+    },
+    PreferentialDuo {
+        project_id_1: ProjectId,
+        project_id_2: ProjectId,
+    },
 }
 
+
 impl UserBehavior {
-    fn gen(&mut self, projects: &Vec<ProjectId>) -> ProjectId {
+    fn gen(&mut self, projects_amount: usize) -> ProjectId {
         match self {
             UserBehavior::AveragedSequential{ amount, left, project_id } => {
                 let max_amount = 10; // @hyper
 
                 if *left == 0 {
                     *amount     = rand::thread_rng().gen_range(1..=max_amount);
-                    *project_id = projects[rand::thread_rng().gen_range(0..projects.len())];
+                    *project_id = rand::thread_rng().gen_range(0..projects_amount);
                     *left       = *amount;
                 }
                 *left -= 1;
@@ -65,56 +72,87 @@ impl UserBehavior {
                 *project_id
             },
             UserBehavior::AveragedRandom => {
-                let project_id = projects[rand::thread_rng().gen_range(0..projects.len())];
-                project_id
+                rand::thread_rng().gen_range(0..projects_amount)
+            },
+            UserBehavior::PreferentialMono{ project_id } =>{
+                let preferential_probability = 0.7;
+                let use_preferred = rand::thread_rng().sample::<f32, _>(Open01) > preferential_probability;
+                if use_preferred {
+                    *project_id
+                } else {
+                    rand::thread_rng().gen_range(0..projects_amount)
+                }
+            },
+            UserBehavior::PreferentialDuo{ project_id_1, project_id_2 } =>{
+                let preferential_probability = 0.7 / 2.0;
+                let use_preferred_chance = rand::thread_rng().sample::<f32, _>(Open01);
+                if use_preferred_chance <= preferential_probability {
+                    *project_id_1
+                } else if use_preferred_chance <= 2.0 * preferential_probability {
+                    *project_id_2
+                } else {
+                    rand::thread_rng().gen_range(0..projects_amount)
+                }
             },
         }
     }
 
-    // fn averaged_sequential() -> UserBehavior {
-    //     
-    // }
-    // fn averaged_random() -> UserBehavior {
-    //     
-    // }
-
-    fn random() -> UserBehavior {
-        let enum_amount = 2; // XXX: UserBehavior enum amount
-        match rand::thread_rng().gen_range(0..enum_amount) {
+    fn random(projects_amount: usize) -> UserBehavior {
+        match rand::thread_rng().gen_range(0..UserBehavior::VARIANT_COUNT) {
             0 => UserBehavior::AveragedSequential{ amount: /* any */ 0, left: 0, project_id: /* any */ 0 },
             1 => UserBehavior::AveragedRandom,
+            2 => UserBehavior::PreferentialMono{ project_id: rand::thread_rng().gen_range(0..projects_amount) },
+            3 => {
+                assert!(projects_amount > 1);
+                let project_id_1 = rand::thread_rng().gen_range(0..projects_amount);
+                let project_id_2 = loop {
+                    let project_id = rand::thread_rng().gen_range(0..projects_amount);
+                    if project_id != project_id_1 {
+                        break project_id;
+                    }
+                };
+                UserBehavior::PreferentialDuo{ project_id_1, project_id_2 }
+            },
             _ => panic!("Bad range for UserBehavior random"),
         }
         // UserBehavior::AveragedSequential{ amount: /* any */ 0, left: 0, project_id: /* any */ 0 }
     }
 }
 
-fn subset_of_size(_size: usize, projects: &Vec<ProjectId>) -> Vec<ProjectId> {
-    projects.clone()
+fn generate_count_random_indices_until(count: u32, len: usize) -> Vec<ProjectId> {
+    let mut vec = Vec::with_capacity(count as usize);
+    let mut left = count;
+    for index in 0..len {
+        let remaining_indices = len - index;
+        let take_probability = (left as f32) / (remaining_indices as f32);
+        let take = rand::thread_rng().sample::<f32, _>(Open01) < take_probability;
+        if take {
+            vec.push(index);
+            left -= 1;
+        }
+        if left == 0 { break };
+    }
+    vec
 }
 
 struct User {
     user_behavior: UserBehavior,
     id: UserId,
-    projects: Vec<ProjectId>,
+    project_ids: Vec<ProjectId>,
 }
 
 impl User {
-    // fn new(user_behaviour) -> UserBehaviorStream {
-    //     UserBehaviorStream{ user_behavior, id, projects }
-    // }
-
     fn gen(&mut self) -> ProjectId {
-        self.user_behavior.gen(&self.projects)
+        self.user_behavior.gen(self.project_ids.len())
     }
 
-    fn create_users(users_amount: usize, projects: Vec<ProjectId>) -> Vec<User> {
+    fn create_users(users_amount: usize, projects_amount: usize) -> Vec<User> {
         let projects_per_user = 5; // @hyper
         let mut vec = Vec::with_capacity(users_amount);
         for id in 0..users_amount {
-            let user_behavior = UserBehavior::random();
-            let user_projects = subset_of_size(projects_per_user, &projects);
-            vec.push(User{ user_behavior, id: id as UserId, projects: user_projects });
+            let user_behavior = UserBehavior::random(projects_amount);
+            let project_ids = generate_count_random_indices_until(projects_per_user, projects_amount);
+            vec.push(User{ user_behavior, id: id as UserId, project_ids });
         }
         vec
     }
@@ -143,7 +181,7 @@ enum MyEnum {
 }
 
 
-type ProjectId = u32;
+type ProjectId = usize;
 type UserId = u32;
 type Time = u32;
 
@@ -156,20 +194,11 @@ struct UserRequest {
     time: Time,
 }
 
-// impl UserRequest {
-    // fn for_behavior(behavior: UserBehavior) -> UserRequest {
-    //
-    // }
-    // fn new(id: UserId, from: Location, time: Time) -> UserRequest {
-    //     let max_action_time = 10;
-    //     let action_time = rand::thread_rng().gen_range(1..=max_action_time);
-    //     let operation = Operation::new(OperationType::random(), action_time);
-    //     UserRequest{ id, from, operation, time }
-    // }
-    // fn new(id: UserId, time: Time) -> UserRequest {
-    //     UserRequest{ id, time }
-    // }
-// }
+
+fn describe_user(User{ user_behavior, id, project_ids }: &User) {
+    println!("User {} has behavior {:?} and projects with ids={:?}", id, user_behavior, project_ids);
+}
+
 // ============================================================================
 // ============================================================================
 // ============================================================================
@@ -177,23 +206,21 @@ struct UserRequest {
 async fn main() -> Result<()> {
     // ======== Hyper-parameters ========
     let request_stream_lambda = 500.0;
+    let simulation_request_count = 100;
+    let projects = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"]; // @hyper
+    let projects_count = projects.len();
+    let user_amount = 5; // @hyper
+    let mut users = User::create_users(user_amount, projects_count);
 
+    for user in users.iter() {
+        describe_user(&user);
+    }
 
-    // let mut c = MyEnum::Second{a:1, b:2};
-    // let content = match c {
-    //     MyEnum::Second{ref mut a, ref mut b} => a,
-    //     _ => unreachable!(),
-    // };
-    // *content += 1;
 
 
     let (spawner_tx, spawner_rx) = channel();
     // Responsible for spawning Tasks
     thread::spawn(move|| {
-        let user_amount = 5; // @hyper
-        let projects = vec![1,2,3,4,5,6,7,8,9,10]; // @hyper
-        let mut users = User::create_users(user_amount, projects);
-
         let mut time = 0;
         loop {
             // Pick random user
@@ -204,7 +231,7 @@ async fn main() -> Result<()> {
             let project_id = user.gen();
 
             // Send for execution
-            spawner_tx.send(UserRequest{ id: user.id, project_id, time }).unwrap();
+            spawner_tx.send(Some(UserRequest{ id: user.id, project_id, time })).unwrap();
 
             // Go to sleep
             let sleep_duration = request_stream_lambda * 2.71828f32.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
@@ -212,13 +239,22 @@ async fn main() -> Result<()> {
             // println!("Sleeping for {}ms...", sleep_duration);
 
             time += 1;
+
+            // Finish simulation?
+            if time == simulation_request_count {
+                spawner_tx.send(None).unwrap();
+            }
         }
     });
 
 
     loop {
-        let request = spawner_rx.recv().expect("dead spawner_tx channel");
-        println!("Got {:?}", request);
+        if let Some(UserRequest{ id, project_id, time }) = spawner_rx.recv().expect("dead spawner_tx channel") {
+            println!("At [{:>3}] got request from {} to project {}", time, id, projects[project_id]);
+        } else {
+            println!(":> Simulation finished (requests stream exhausted)");
+            break;
+        }
     }
 
 

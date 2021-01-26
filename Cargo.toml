@@ -13,6 +13,7 @@ futures-util = "0.3.8"
 futures = "0.3.8"
 rand = "0.8.0"
 rand_distr = "0.4.0"
+variant_count = "*"
 
 [dependencies.serde]
 version = "1.0.111"
