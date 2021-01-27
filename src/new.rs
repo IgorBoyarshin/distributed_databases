@@ -198,12 +198,95 @@ struct UserRequest {
 fn describe_user(User{ user_behavior, id, project_ids }: &User) {
     println!("User {} has behavior {:?} and projects with ids={:?}", id, user_behavior, project_ids);
 }
+// ============================================================================
+// ============================================================================
+// ============================================================================
+async fn ping(client: &Client) -> Result<u128> {
+    let start = time::Instant::now();
+    {
+        let _names = client.database("users").list_collection_names(None).await?;
+        // let _s = dump_to_str(&client).await?;
+    }
+    let elapsed = start.elapsed().as_millis();
+    Ok(elapsed)
+}
 
+async fn ping_multiple(client: &Client) -> Result<Vec<u128>> {
+    let amount = 10;
+    let mut times = Vec::with_capacity(amount);
+    for _ in 0..amount {
+        times.push(ping(&client).await?);
+    }
+    Ok(times)
+}
+
+async fn ping_multiple_parallel(client: &Client) -> Result<Vec<u128>> {
+    let amount = 10;
+    let mut operations = Vec::with_capacity(amount);
+    for _ in 0..amount {
+        operations.push(ping(&client));
+    }
+    let times = try_join_all(operations).await?;
+    Ok(times)
+}
+// ============================================================================
+// ============================================================================
+// ============================================================================
+#[derive(Deserialize, Serialize)]
+struct UserData {
+    name: String,
+    size_bytes: u32,
+    content: Vec<u32>,
+    created_at: Time,
+}
+fn dump_user_data_to_str(UserData{ name, created_at, .. }: UserData) -> String {
+    format!("[at: {}, of size: {}]", created_at, name)
+}
+async fn dump_to_str(client: &Client) -> Result<String> {
+    let mut result = String::new();
+    let db = client.database("users");
+    for collection_name in db.list_collection_names(None).await? {
+        result.push_str(&format!(">>{}\n", collection_name));
+
+        // let cursor = db.collection(&collection_name).find(None, None).await?;
+        // let entries: Vec<_> = cursor.collect().await;
+        // println!("<<{} entries>>", entries.len());
+
+        let mut cursor = db.collection(&collection_name).find(None, None).await?;
+        while let Some(document) = cursor.next().await {
+            let user_data = bson::from_bson(Bson::Document(document?))?;
+            result.push('\t');
+            result.push_str(&dump_user_data_to_str(user_data));
+            result.push('\n');
+        }
+    }
+    result.push('\n');
+    Ok(result)
+}
 // ============================================================================
 // ============================================================================
 // ============================================================================
 #[tokio::main]
 async fn main() -> Result<()> {
+    let client1 = Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
+    let client2 = Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
+    // let s = dump_to_str(&client).await?;
+    // let (ping1, ping2) = try_join!(ping(&client1), ping(&client2))?;
+    // println!("Client 1 ping = {}ms", ping1);
+    // println!("Client 2 ping = {}ms", ping2);
+    // let ((ping1, max1, min1), (ping2, max2, min2)) = try_join!(ping_average(&client1), ping_average(&client2))?;
+    // println!("Client 1 ping = {}ms with min = {}ms and max = {}ms", ping1, min1, max1);
+    // println!("Client 2 ping = {}ms with min = {}ms and max = {}ms", ping2, min2, max2);
+
+    let start = time::Instant::now();
+    let (pings_1, pings_2) = try_join!(ping_multiple_parallel(&client1), ping_multiple_parallel(&client2))?;
+    println!("Client 1 pings = {:?}", pings_1);
+    println!("Client 2 pings = {:?}", pings_2);
+    println!("Elapsed = {}ms", start.elapsed().as_millis());
+
+    if true { return Ok(()) };
+
+
     // ======== Hyper-parameters ========
     let request_stream_lambda = 500.0;
     let simulation_request_count = 100;
