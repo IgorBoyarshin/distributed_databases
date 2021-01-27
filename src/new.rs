@@ -35,9 +35,6 @@ use std::sync::mpsc::channel;
 // ============================================================================
 // ============================================================================
 // ============================================================================
-
-
-
 #[derive(VariantCount, Debug)]
 enum UserBehavior {
     AveragedSequential {
@@ -54,7 +51,6 @@ enum UserBehavior {
         project_id_2: ProjectId,
     },
 }
-
 
 impl UserBehavior {
     fn gen(&mut self, projects_amount: usize) -> ProjectId {
@@ -115,11 +111,34 @@ impl UserBehavior {
             },
             _ => panic!("Bad range for UserBehavior random"),
         }
-        // UserBehavior::AveragedSequential{ amount: /* any */ 0, left: 0, project_id: /* any */ 0 }
+    }
+}
+// ============================================================================
+// ============================================================================
+// ============================================================================
+struct User {
+    user_behavior: UserBehavior,
+    id: UserId,
+    project_ids: Vec<ProjectId>,
+}
+
+impl User {
+    fn gen(&mut self) -> ProjectId {
+        self.user_behavior.gen(self.project_ids.len())
+    }
+
+    fn create_users(users_amount: usize, projects_amount: usize, projects_per_user: usize) -> Vec<User> {
+        let mut vec = Vec::with_capacity(users_amount);
+        for id in 0..users_amount {
+            let user_behavior = UserBehavior::random(projects_amount);
+            let project_ids = generate_count_random_indices_until(projects_per_user, projects_amount);
+            vec.push(User{ user_behavior, id: id as UserId, project_ids });
+        }
+        vec
     }
 }
 
-fn generate_count_random_indices_until(count: u32, len: usize) -> Vec<ProjectId> {
+fn generate_count_random_indices_until(count: usize, len: usize) -> Vec<ProjectId> {
     let mut vec = Vec::with_capacity(count as usize);
     let mut left = count;
     for index in 0..len {
@@ -135,47 +154,12 @@ fn generate_count_random_indices_until(count: u32, len: usize) -> Vec<ProjectId>
     vec
 }
 
-struct User {
-    user_behavior: UserBehavior,
-    id: UserId,
-    project_ids: Vec<ProjectId>,
+fn describe_user(User{ user_behavior, id, project_ids }: &User) {
+    println!("User {} has behavior {:?} and projects with ids={:?}", id, user_behavior, project_ids);
 }
-
-impl User {
-    fn gen(&mut self) -> ProjectId {
-        self.user_behavior.gen(self.project_ids.len())
-    }
-
-    fn create_users(users_amount: usize, projects_amount: usize) -> Vec<User> {
-        let projects_per_user = 5; // @hyper
-        let mut vec = Vec::with_capacity(users_amount);
-        for id in 0..users_amount {
-            let user_behavior = UserBehavior::random(projects_amount);
-            let project_ids = generate_count_random_indices_until(projects_per_user, projects_amount);
-            vec.push(User{ user_behavior, id: id as UserId, project_ids });
-        }
-        vec
-    }
-}
-
-// impl Iterator for User {
-//     type Item = UserRequest;
-//
-//     let mut time = 0;
-//
-//     fn next(&mut self) -> Option<UserRequest> {
-//         match self {
-//             UserBehavior::AveragedSequential => None,
-//             UserBehavior::AveragedRandom => {
-//                 let project_id = rand::thread_rng().gen_range(0..self.project_names.len());
-//                 Some(UserRequest{ self.id, project_id, time })
-//             },
-//         }
-//     }
-// }
-
-
-
+// ============================================================================
+// ============================================================================
+// ============================================================================
 type ProjectId = usize;
 type UserId = u32;
 type Time = u128;
@@ -188,11 +172,6 @@ struct UserRequest {
     // from: Location,
     // operation: Operation,
     // time: Time,
-}
-
-
-fn describe_user(User{ user_behavior, id, project_ids }: &User) {
-    println!("User {} has behavior {:?} and projects with ids={:?}", id, user_behavior, project_ids);
 }
 // ============================================================================
 // ============================================================================
@@ -215,16 +194,6 @@ async fn ping_multiple(client: &Client) -> Result<Vec<Time>> {
     }
     Ok(times)
 }
-
-// async fn ping_multiple_parallel(client: &Client) -> Result<Vec<Time>> {
-//     let amount = 10;
-//     let mut operations = Vec::with_capacity(amount);
-//     for _ in 0..amount {
-//         operations.push(ping(&client));
-//     }
-//     let times = try_join_all(operations).await?;
-//     Ok(times)
-// }
 // ============================================================================
 // ============================================================================
 // ============================================================================
@@ -237,7 +206,8 @@ struct SimulationHyperParameters {
 }
 
 struct SimulationParameters {
-
+    spread_rate: f32,
+    decay_rate: f32,
 }
 
 struct SimulationOutput {
@@ -245,7 +215,7 @@ struct SimulationOutput {
 }
 
 async fn simulate(
-        SimulationParameters{  }: SimulationParameters,
+        SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
         SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names, dbs }: SimulationHyperParameters) -> Result<SimulationOutput> {
 
     println!(":> Performing ping test...");
@@ -329,9 +299,11 @@ struct UserData {
     content: Vec<u32>,
     created_at: Time,
 }
+
 fn dump_user_data_to_str(UserData{ name, created_at, .. }: UserData) -> String {
     format!("[at: {}, of size: {}]", created_at, name)
 }
+
 async fn dump_to_str(client: &Client) -> Result<String> {
     let mut result = String::new();
     let db = client.database("users");
@@ -356,8 +328,7 @@ async fn dump_to_str(client: &Client) -> Result<String> {
 // ============================================================================
 // ============================================================================
 // ============================================================================
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
     let dbs = vec![
         Database {
             client: Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
@@ -369,27 +340,50 @@ async fn main() -> Result<()> {
         },
     ];
     let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"]; // @hyper
+
+    let projects_per_user = 4;
     let projects_count = project_names.len();
-    let users = User::create_users(5, projects_count);
+    // Users are created here and not inside simulation based on hyperparameters
+    // because there is an element of random in creation (e.g. Behavior), and
+    // we would like all simulation to be conducted with the same set of users.
+    let users = User::create_users(5, projects_count, projects_per_user);
 
-    println!(":> Describing users:");
-    for user in users.iter() { describe_user(&user); }
-    println!();
-
-    let hyperparameters = SimulationHyperParameters {
+    Ok(SimulationHyperParameters {
         request_amount: 64,
         input_intensity: 500.0,
         dbs,
         project_names,
         users,
-    };
-    let parameters = SimulationParameters {
+    })
+}
 
-    };
+fn get_parameters() -> SimulationParameters {
+    SimulationParameters {
+        spread_rate: 2.0,
+        decay_rate: 3.0,
+    }
+}
 
-    let SimulationOutput{ duration } = simulate(parameters, hyperparameters).await?;
+fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &SimulationHyperParameters) {
+    println!(":> Users:");
+    for user in users.iter() { describe_user(&user); }
+    println!();
+}
+
+fn describe_simulation_output(SimulationOutput{ duration }: &SimulationOutput) {
     println!(":> Simulation finished in {} seconds", duration.as_secs());
+}
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    let hyperparameters = get_hyperparameters().await?;
+    let parameters = get_parameters();
+
+    describe_simulation_hyperparameters(&hyperparameters);
+
+    let output = simulate(parameters, hyperparameters).await?;
+
+    describe_simulation_output(&output);
 
     Ok(())
 }
