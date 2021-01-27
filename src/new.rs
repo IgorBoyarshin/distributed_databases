@@ -165,28 +165,45 @@ type UserId = u32;
 type Time = u128;
 type Counter = usize;
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
+// #[derive(Debug, Copy, Clone, Deserialize, Serialize)]
+#[derive(Debug, Copy, Clone)]
 struct UserRequest {
     id: UserId,
     project_id: ProjectId,
+    created_at: time::Instant,
+    received_at: Option<time::Instant>,
+    assigned_at: Option<time::Instant>,
+    finished_at: Option<time::Instant>,
+    processed_at_worker: Option<usize>,
     // from: Location,
     // operation: Operation,
     // time: Time,
 }
+
+impl UserRequest {
+    fn new(id: UserId, project_id: ProjectId, created_at: time::Instant) -> UserRequest {
+        UserRequest {
+            id, project_id, created_at,
+            received_at: None,
+            assigned_at: None,
+            finished_at: None,
+            processed_at_worker: None,
+        }
+    }
+}
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn ping(client: &Client) -> Result<Time> {
+async fn ping(client: &Client) -> Result<time::Duration> {
     let start = time::Instant::now();
     {
         let _names = client.database("users").list_collection_names(None).await?;
         // let _s = dump_to_str(&client).await?;
     }
-    let elapsed = start.elapsed().as_millis();
-    Ok(elapsed)
+    Ok(start.elapsed())
 }
 
-async fn ping_multiple(client: &Client) -> Result<Vec<Time>> {
+async fn ping_multiple(client: &Client) -> Result<Vec<time::Duration>> {
     let amount = 10;
     let mut times = Vec::with_capacity(amount);
     for _ in 0..amount {
@@ -212,20 +229,12 @@ struct SimulationParameters {
 
 struct SimulationOutput {
     duration: time::Duration,
+    processed_user_requests: Vec<UserRequest>,
 }
 
 async fn simulate(
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
-        SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names, dbs }: SimulationHyperParameters) -> Result<SimulationOutput> {
-
-    println!(":> Performing ping test...");
-    let (pings_1, pings_2) = try_join!(ping_multiple(&dbs[0].client), ping_multiple(&dbs[1].client))?;
-    println!("Client 1 pings = {:?}ms", pings_1);
-    println!("Client 2 pings = {:?}ms", pings_2);
-    println!();
-
-
-
+        SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names: _, dbs }: SimulationHyperParameters) -> Result<SimulationOutput> {
     println!(":> Starting simulation...");
     let (spawner_tx, spawner_rx) = channel();
 
@@ -241,7 +250,8 @@ async fn simulate(
             let project_id = user.gen();
 
             // Send for execution
-            spawner_tx.send(Some(UserRequest{ id: user.id, project_id })).unwrap();
+            let request = UserRequest::new(user.id, project_id, time::Instant::now());
+            spawner_tx.send(Some(request)).unwrap();
 
             // Go to sleep
             let e = 2.71828f32;
@@ -262,18 +272,68 @@ async fn simulate(
     // Responsible for processing UserRequests
     let simulation_start = time::Instant::now();
     let mut last_at = time::Instant::now();
+    let mut workers: Vec<Option<UserRequest>> = Vec::with_capacity(dbs.len());
+    for _ in 0..dbs.len() {
+        workers.push(None); // all are available at the beginning
+    }
+    let mut processed_user_requests = Vec::new();
+    let (counter_tx, counter_rx) = channel();
     loop {
-        if let Some(UserRequest{ id, project_id }) = spawner_rx.recv().expect("dead spawner_tx channel") {
+        if let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
             let start = time::Instant::now();
-            print!("[Since last = {:>5} millis]\t", last_at.elapsed().as_millis());
+            let _since_last = last_at.elapsed();
+            let _reception_time = simulation_start.elapsed();
             last_at = start;
-            print!("At {:>6}ms got request from {} to project {:<16}", simulation_start.elapsed().as_millis(), id, project_names[project_id]);
+            user_request.received_at = Some(start);
 
-            // Process here
-            thread::sleep(time::Duration::from_millis(1));
+            // Check for workers that have finished
+            let exist_available_worker = workers.iter().any(|&r| r.is_none());
+            // TODO: duplicate code follows
+            if !exist_available_worker {
+                // ... then unconditionally must wait for at least one to finish
+                let waiting_start = time::Instant::now();
+                let (finished_worker, finished_at) = counter_rx.recv().expect("counter rx logic failure");
+                println!("No available workers, waiting for {} micros...", waiting_start.elapsed().as_micros());
+                let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
+                assert!(worker.is_some()); // must be not available yet. WTF with type???
+                let mut user_request = worker.take().unwrap();
+                user_request.finished_at = Some(finished_at);
+                processed_user_requests.push(user_request);
+            }
+            // Try to collect others but do not block
+            while let Ok((finished_worker, finished_at)) = counter_rx.try_recv() {
+                let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
+                assert!(worker.is_some()); // must be not available yet. WTF with type???
+                let mut user_request = worker.take().unwrap();
+                user_request.finished_at = Some(finished_at);
+                processed_user_requests.push(user_request);
+            }
 
-            let elapsed_micros = start.elapsed().as_micros();
-            println!("[processed in {:>5} micros]", elapsed_micros);
+            // Choose worker to do the job
+            let available_workers = workers.iter().enumerate()
+                .filter(|(_i, &user_request)| user_request.is_none())
+                .collect::<Vec<_>>(); // TODO: do we need Vec???
+            assert!(available_workers.len() > 0); // because we have specifically waited for at least one to finish
+            // XXX: for now, pick the first available worker, as they are sorted
+            // lowest to highest response time.
+            let (chosen_worker, _) = available_workers[0];
+            println!("Choosing worker {}", chosen_worker);
+            user_request.assigned_at = Some(time::Instant::now());
+            user_request.processed_at_worker = Some(chosen_worker);
+            workers[chosen_worker] = Some(user_request);
+            let inner_counter_tx = counter_tx.clone();
+            let _t = thread::spawn(move|| {
+                // Process here
+                thread::sleep(time::Duration::from_millis(chosen_worker as u64 * 300 + 301));
+
+                let finish = time::Instant::now();
+                inner_counter_tx.send((chosen_worker, finish)).expect("broken channel"); // report that this worker has finished and is free now
+            });
+
+            let _elapsed_micros = start.elapsed().as_micros();
+            // print!("[Since last = {:>5} millis]\t", since_last.as_millis());
+            // print!("At {:>6}ms got request from {} to project {:<16}", reception_time.as_millis(), id, project_names[project_id]);
+            // println!("[processed in {:>5} micros]", elapsed_micros);
         } else {
             break;
         }
@@ -281,7 +341,7 @@ async fn simulate(
     let simulation_duration = simulation_start.elapsed();
     println!();
 
-    Ok(SimulationOutput{ duration: simulation_duration })
+    Ok(SimulationOutput{ duration: simulation_duration, processed_user_requests })
 }
 // ============================================================================
 // ============================================================================
@@ -337,6 +397,14 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
             client: Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
             name: "Orange Tree",
         },
+        Database {
+            client: Client::with_uri_str(env::var("MONGO_LEMON").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
+            name: "Lemon Tree",
+        },
+        Database {
+            client: Client::with_uri_str(env::var("MONGO_MAPLE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
+            name: "Maple Tree",
+        },
     ];
     let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
 
@@ -348,7 +416,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
     let users = User::create_users(5, projects_count, projects_per_user);
 
     Ok(SimulationHyperParameters {
-        request_amount: 64,
+        request_amount: 32,
         input_intensity: 500.0,
         dbs,
         project_names,
@@ -369,16 +437,41 @@ fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &
     println!();
 }
 
-fn describe_simulation_output(SimulationOutput{ duration }: &SimulationOutput) {
+fn describe_simulation_output(SimulationOutput{ duration, processed_user_requests }: &SimulationOutput) {
     println!(":> Simulation finished in {} seconds", duration.as_secs());
+    println!(":> Processed UserRequests statistics:");
+    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, .. } in processed_user_requests {
+        let received_at = received_at.expect("empty time Option while describing processed request");
+        let assigned_at = assigned_at.expect("empty time Option while describing processed request");
+        let finished_at = finished_at.expect("empty time Option while describing processed request");
+        let processed_at_worker = processed_at_worker.expect("empty num Option while describing processed request");
+        println!("Received after {:>6} micros, assigned after {:>7} micros, finished after {:>5} millis, processed at {}",
+            received_at.duration_since(*created_at).as_micros(),
+            assigned_at.duration_since(*created_at).as_micros(),
+            finished_at.duration_since(*created_at).as_millis(),
+            processed_at_worker,
+        );
+    }
+    println!();
+}
+
+async fn perform_ping_test(dbs: &Vec<Database>) -> Result<Vec<time::Duration>> {
+    println!(":> Performing ping test...");
+    let (pings_1, pings_2) = try_join!(ping_multiple(&dbs[0].client), ping_multiple(&dbs[1].client))?;
+    println!("Client 1 pings = {:?}ms", pings_1.into_iter().map(|v| v.as_millis()).collect::<Vec<_>>());
+    println!("Client 2 pings = {:?}ms", pings_2.into_iter().map(|v| v.as_millis()).collect::<Vec<_>>());
+    println!();
+    Ok(Vec::new())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+
     let hyperparameters = get_hyperparameters().await?;
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
+    // perform_ping_test(&hyperparameters.dbs).await?;
 
     let output = simulate(parameters, hyperparameters).await?;
 
