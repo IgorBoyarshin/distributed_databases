@@ -56,7 +56,7 @@ impl UserBehavior {
     fn gen(&mut self, projects_amount: usize) -> ProjectId {
         match self {
             UserBehavior::AveragedSequential{ amount, left, project_id } => {
-                let max_amount = 10; // @hyper
+                let max_amount = 10;
 
                 if *left == 0 {
                     *amount     = rand::thread_rng().gen_range(1..=max_amount);
@@ -247,7 +247,6 @@ async fn simulate(
             let e = 2.71828f32;
             let sleep_duration = input_intensity * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
             thread::sleep(time::Duration::from_millis(sleep_duration as u64));
-            // println!("Sleeping for {}ms...", sleep_duration);
 
             time += 1;
 
@@ -339,7 +338,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
             name: "Orange Tree",
         },
     ];
-    let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"]; // @hyper
+    let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
 
     let projects_per_user = 4;
     let projects_count = project_names.len();
