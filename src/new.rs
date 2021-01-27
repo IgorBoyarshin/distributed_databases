@@ -167,7 +167,7 @@ impl User {
 //         match self {
 //             UserBehavior::AveragedSequential => None,
 //             UserBehavior::AveragedRandom => {
-//                 let project_id = rand::thread_rng().gen_range(0..self.projects.len());
+//                 let project_id = rand::thread_rng().gen_range(0..self.project_names.len());
 //                 Some(UserRequest{ self.id, project_id, time })
 //             },
 //         }
@@ -175,15 +175,11 @@ impl User {
 // }
 
 
-enum MyEnum {
-    First,
-    Second{a: u32, b: u32},
-}
-
 
 type ProjectId = usize;
 type UserId = u32;
-type Time = u32;
+type Time = u128;
+type Counter = usize;
 
 #[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 struct UserRequest {
@@ -191,7 +187,7 @@ struct UserRequest {
     project_id: ProjectId,
     // from: Location,
     // operation: Operation,
-    time: Time,
+    // time: Time,
 }
 
 
@@ -201,7 +197,7 @@ fn describe_user(User{ user_behavior, id, project_ids }: &User) {
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn ping(client: &Client) -> Result<u128> {
+async fn ping(client: &Client) -> Result<Time> {
     let start = time::Instant::now();
     {
         let _names = client.database("users").list_collection_names(None).await?;
@@ -211,7 +207,7 @@ async fn ping(client: &Client) -> Result<u128> {
     Ok(elapsed)
 }
 
-async fn ping_multiple(client: &Client) -> Result<Vec<u128>> {
+async fn ping_multiple(client: &Client) -> Result<Vec<Time>> {
     let amount = 10;
     let mut times = Vec::with_capacity(amount);
     for _ in 0..amount {
@@ -220,18 +216,112 @@ async fn ping_multiple(client: &Client) -> Result<Vec<u128>> {
     Ok(times)
 }
 
-async fn ping_multiple_parallel(client: &Client) -> Result<Vec<u128>> {
-    let amount = 10;
-    let mut operations = Vec::with_capacity(amount);
-    for _ in 0..amount {
-        operations.push(ping(&client));
+// async fn ping_multiple_parallel(client: &Client) -> Result<Vec<Time>> {
+//     let amount = 10;
+//     let mut operations = Vec::with_capacity(amount);
+//     for _ in 0..amount {
+//         operations.push(ping(&client));
+//     }
+//     let times = try_join_all(operations).await?;
+//     Ok(times)
+// }
+// ============================================================================
+// ============================================================================
+// ============================================================================
+struct SimulationHyperParameters {
+    request_amount: usize,
+    input_intensity: f32,
+    dbs: Vec<Database>,
+    project_names: Vec<&'static str>,
+    users: Vec<User>,
+}
+
+struct SimulationParameters {
+
+}
+
+struct SimulationOutput {
+    duration: time::Duration,
+}
+
+async fn simulate(
+        SimulationParameters{  }: SimulationParameters,
+        SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names, dbs }: SimulationHyperParameters) -> Result<SimulationOutput> {
+
+    println!(":> Performing ping test...");
+    let (pings_1, pings_2) = try_join!(ping_multiple(&dbs[0].client), ping_multiple(&dbs[1].client))?;
+    println!("Client 1 pings = {:?}ms", pings_1);
+    println!("Client 2 pings = {:?}ms", pings_2);
+    println!();
+
+
+
+    println!(":> Starting simulation...");
+    let (spawner_tx, spawner_rx) = channel();
+
+    // Responsible for spawning UserRequests
+    thread::spawn(move|| {
+        let mut time = 0;
+        loop {
+            // Pick random user
+            let len = users.len();
+            let user = &mut users[rand::thread_rng().gen_range(0..len)];
+
+            // Pick project for this User according to his Strategy
+            let project_id = user.gen();
+
+            // Send for execution
+            spawner_tx.send(Some(UserRequest{ id: user.id, project_id })).unwrap();
+
+            // Go to sleep
+            let e = 2.71828f32;
+            let sleep_duration = input_intensity * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
+            thread::sleep(time::Duration::from_millis(sleep_duration as u64));
+            // println!("Sleeping for {}ms...", sleep_duration);
+
+            time += 1;
+
+            // Finish simulation?
+            if time == request_amount {
+                spawner_tx.send(None).unwrap();
+                break;
+            }
+        }
+    });
+
+
+    // Responsible for processing UserRequests
+    let simulation_start = time::Instant::now();
+    let mut last_at = time::Instant::now();
+    loop {
+        if let Some(UserRequest{ id, project_id }) = spawner_rx.recv().expect("dead spawner_tx channel") {
+            let start = time::Instant::now();
+            print!("[Since last = {:>5} millis]\t", last_at.elapsed().as_millis());
+            last_at = start;
+            print!("At {:>6}ms got request from {} to project {:<16}", simulation_start.elapsed().as_millis(), id, project_names[project_id]);
+
+            // Process here
+            thread::sleep(time::Duration::from_millis(1));
+
+            let elapsed_micros = start.elapsed().as_micros();
+            println!("[processed in {:>5} micros]", elapsed_micros);
+        } else {
+            break;
+        }
     }
-    let times = try_join_all(operations).await?;
-    Ok(times)
+    let simulation_duration = simulation_start.elapsed();
+    println!();
+
+    Ok(SimulationOutput{ duration: simulation_duration })
 }
 // ============================================================================
 // ============================================================================
 // ============================================================================
+struct Database {
+    client: Client,
+    name: &'static str,
+}
+
 #[derive(Deserialize, Serialize)]
 struct UserData {
     name: String,
@@ -268,88 +358,37 @@ async fn dump_to_str(client: &Client) -> Result<String> {
 // ============================================================================
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client1 = Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
-    let client2 = Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?;
-    // let s = dump_to_str(&client).await?;
-    // let (ping1, ping2) = try_join!(ping(&client1), ping(&client2))?;
-    // println!("Client 1 ping = {}ms", ping1);
-    // println!("Client 2 ping = {}ms", ping2);
-    // let ((ping1, max1, min1), (ping2, max2, min2)) = try_join!(ping_average(&client1), ping_average(&client2))?;
-    // println!("Client 1 ping = {}ms with min = {}ms and max = {}ms", ping1, min1, max1);
-    // println!("Client 2 ping = {}ms with min = {}ms and max = {}ms", ping2, min2, max2);
+    let dbs = vec![
+        Database {
+            client: Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
+            name: "Christmas Tree",
+        },
+        Database {
+            client: Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
+            name: "Orange Tree",
+        },
+    ];
+    let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"]; // @hyper
+    let projects_count = project_names.len();
+    let users = User::create_users(5, projects_count);
 
-    let start = time::Instant::now();
-    let (pings_1, pings_2) = try_join!(ping_multiple_parallel(&client1), ping_multiple_parallel(&client2))?;
-    println!("Client 1 pings = {:?}", pings_1);
-    println!("Client 2 pings = {:?}", pings_2);
-    println!("Elapsed = {}ms", start.elapsed().as_millis());
-
-    if true { return Ok(()) };
-
-
-    // ======== Hyper-parameters ========
-    let request_stream_lambda = 500.0;
-    let simulation_request_count = 100;
-    let projects = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"]; // @hyper
-    let projects_count = projects.len();
-    let user_amount = 5;
-    let mut users = User::create_users(user_amount, projects_count);
-
+    println!(":> Describing users:");
     for user in users.iter() { describe_user(&user); }
+    println!();
 
+    let hyperparameters = SimulationHyperParameters {
+        request_amount: 64,
+        input_intensity: 500.0,
+        dbs,
+        project_names,
+        users,
+    };
+    let parameters = SimulationParameters {
 
-    let (spawner_tx, spawner_rx) = channel();
+    };
 
-    // Responsible for spawning UserRequests
-    thread::spawn(move|| {
-        let mut time = 0;
-        loop {
-            // Pick random user
-            let len = users.len();
-            let user = &mut users[rand::thread_rng().gen_range(0..len)];
-
-            // Pick project for this User according to his Strategy
-            let project_id = user.gen();
-
-            // Send for execution
-            spawner_tx.send(Some(UserRequest{ id: user.id, project_id, time })).unwrap();
-
-            // Go to sleep
-            let e = 2.71828f32;
-            let sleep_duration = request_stream_lambda * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
-            thread::sleep(time::Duration::from_millis(sleep_duration as u64));
-            // println!("Sleeping for {}ms...", sleep_duration);
-
-            time += 1;
-
-            // Finish simulation?
-            if time == simulation_request_count {
-                spawner_tx.send(None).unwrap();
-                break;
-            }
-        }
-    });
-
-
-    // Responsible for processing UserRequests
-    let mut last_at = time::Instant::now();
-    loop {
-        if let Some(UserRequest{ id, project_id, time }) = spawner_rx.recv().expect("dead spawner_tx channel") {
-            let start = time::Instant::now();
-            print!("[Since last = {:>5} millis]\t", last_at.elapsed().as_millis());
-            last_at = start;
-            print!("At [{:>3}] got request from {} to project {:>16}", time, id, projects[project_id]);
-
-            // Process here
-            thread::sleep(time::Duration::from_millis(1));
-
-            let elapsed_micros = start.elapsed().as_micros();
-            println!("\t[processed in {:>5} micros]", elapsed_micros);
-        } else {
-            println!(":> Simulation finished (requests stream exhausted)");
-            break;
-        }
-    }
+    let SimulationOutput{ duration } = simulate(parameters, hyperparameters).await?;
+    println!(":> Simulation finished in {} seconds", duration.as_secs());
 
 
     Ok(())
