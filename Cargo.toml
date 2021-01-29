@@ -10,10 +10,12 @@ default-run = "new"
 mongodb = { version = "1.1.1", default-features = false, features = ["async-std-runtime"] }
 tokio = {"version"= "0.3.5", features=["full"]}
 futures-util = "0.3.8"
-futures = "0.3.8"
+futures = { version = "0.3.8", features = ["executor"] }
 rand = "0.8.0"
 rand_distr = "0.4.0"
 variant_count = "*"
+crossbeam = "0.8"
+crossbeam-utils = "0.8"
 
 [dependencies.serde]
 version = "1.0.111"
