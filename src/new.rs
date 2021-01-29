@@ -220,14 +220,14 @@ async fn ping_multiple(client: &Client) -> Result<Vec<time::Duration>> {
 
 async fn determine_ping(client: &Client) -> Result<time::Duration> {
     // Warm up
-    let count = 2;
+    let count = 1;
     for _ in 0..count {
         // Ignore output
         let _duration = ping(&client).await?;
         // println!("Have warm {}", _duration.as_millis());
     }
     // Average
-    let count = 5;
+    let count = 3;
     let mut sum = time::Duration::ZERO;
     for _ in 0..count {
         let duration = ping(&client).await?;
@@ -307,9 +307,8 @@ async fn simulate(
 
             if let Some(input_intensity) = input_intensity {
                 // Go to sleep
-                let e = 2.71828f32;
-                let sleep_duration = input_intensity * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
-                thread::sleep(time::Duration::from_millis(sleep_duration as u64));
+                let sleep_duration_millis = -1000.0 * rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
+                thread::sleep(time::Duration::from_millis(sleep_duration_millis as u64));
             }
 
             time += 1;
@@ -478,10 +477,12 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
     // we would like all simulation to be conducted with the same set of users.
     let users = User::create_users(5, projects_count, projects_per_user);
 
+    let processing_intensity = 4.0 / (0.042 + 0.057 + 0.132 + 0.264);
     Ok(SimulationHyperParameters {
         request_amount: 256,
         // input_intensity: None,
-        input_intensity: Some(100.0),
+        // input_intensity: Some(processing_intensity),
+        input_intensity: Some(4.0 * processing_intensity),
         dbs,
         project_names,
         users,
@@ -542,7 +543,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     }
     average_total_time   /= processed_user_requests.len() as u128;
     average_waiting_time /= processed_user_requests.len() as u128;
-    println!(":> Simulation finished in {} millis", duration.as_millis());
+    println!(":> Simulation finished in {} seconds", duration.as_secs());
     println!("Average total processing time = {}", average_total_time);
     println!("Average waiting time = {}", average_waiting_time);
     println!("Usage count of workers: {:?}", worker_usage_count);
