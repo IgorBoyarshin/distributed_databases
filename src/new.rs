@@ -353,6 +353,10 @@ async fn simulate(
                 // makes sense to set the creation_time as the reception_time (now),
                 // even though *technically* they were all created almost simultaniously
                 // a long time ago.
+                // In this scenario, the processing intensity of the system should
+                // be equal both when calculating the actual value (processed amount
+                // divided by time taken) and when calculating the theoretical value
+                // (using average request processing time).
                 user_request.created_at = start;
             }
 
@@ -487,10 +491,10 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
     // let processing_intensity = 4.0 / (0.042 + 0.057 + 0.132 + 0.264);
     let processing_intensity = 1.0/0.042 + 1.0/0.057 + 1.0/0.132 + 1.0/0.264;
     Ok(SimulationHyperParameters {
-        request_amount: 1024,
+        request_amount: 2048,
         // input_intensity: None,
-        input_intensity: Some(processing_intensity),
-        // input_intensity: Some(8.0 * processing_intensity),
+        input_intensity: Some(0.95 * processing_intensity),
+        // input_intensity: Some(1.05 * processing_intensity),
         dbs,
         project_names,
         users,
@@ -528,7 +532,6 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let processed_at_worker = processed_at_worker.expect("empty num Option while describing processed request");
         let ping_lasted = ping_lasted.expect("empty ping Option while describing processed request");
 
-        // let into_system_after = received_at.duration_since(*created_at).as_micros();
         let waiting_time = assigned_at.duration_since(*created_at).as_millis();
         let total_time = finished_at.duration_since(received_at).as_millis();
         average_total_time += total_time;
@@ -544,21 +547,16 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
             worker_usage_count.push(0);
         }
         worker_usage_count[processed_at_worker] += 1;
-
-        // println!("Received after {:>7} micros, assigned after {:>8} micros, finished after {:>5} millis, processed at {}, ping lasted {}ms",
-        //     received_at.duration_since(*created_at).as_micros(),
-        //     assigned_at.duration_since(*created_at).as_micros(),
-        //     finished_at.duration_since(*created_at).as_millis(),
-        //     processed_at_worker,
-        //     ping_lasted.as_millis(),
-        // );
     }
     average_total_time   /= processed_user_requests.len() as u128;
     average_waiting_time /= processed_user_requests.len() as u128;
     println!(":> Simulation finished in {} seconds", duration.as_secs());
-    println!("Average total processing time = {}", average_total_time);
-    println!("Average waiting time = {}", average_waiting_time);
-    println!("Usage count of workers: {:?}", worker_usage_count);
+    let processing_intensity = 1000.0 * processed_user_requests.len() as f32 / duration.as_millis() as f32;
+    println!(":> Simulation processing intensity is {} requests per second ({} millis per request)",
+        processing_intensity, (1000.0 / processing_intensity) as u32);
+    println!(":> Average total processing time = {} millis", average_total_time);
+    println!(":> Average waiting time = {} millis", average_waiting_time);
+    println!(":> Usage count of workers: {:?}", worker_usage_count);
     println!();
 }
 
