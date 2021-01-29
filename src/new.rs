@@ -506,6 +506,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Processed UserRequests statistics:");
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
+    let mut worker_usage_count = Vec::new(); // TODO: emperically determines amount of workers
     for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, .. } in processed_user_requests {
         let received_at = received_at.expect("empty time Option while describing processed request");
         let assigned_at = assigned_at.expect("empty time Option while describing processed request");
@@ -525,6 +526,12 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
             processed_at_worker,
             ping_lasted.as_millis(),
         );
+
+        while processed_at_worker >= worker_usage_count.len() {
+            worker_usage_count.push(0);
+        }
+        worker_usage_count[processed_at_worker] += 1;
+
         // println!("Received after {:>7} micros, assigned after {:>8} micros, finished after {:>5} millis, processed at {}, ping lasted {}ms",
         //     received_at.duration_since(*created_at).as_micros(),
         //     assigned_at.duration_since(*created_at).as_micros(),
@@ -538,6 +545,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Simulation finished in {} millis", duration.as_millis());
     println!("Average total processing time = {}", average_total_time);
     println!("Average waiting time = {}", average_waiting_time);
+    println!("Usage count of workers: {:?}", worker_usage_count);
     println!();
 }
 
