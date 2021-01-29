@@ -333,70 +333,71 @@ async fn simulate(
     let mut processed_user_requests = Vec::new();
     let (counter_tx, counter_rx) = channel();
     crossbeam_utils::thread::scope(|scope| {
-        loop {
-            if let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
-                let start = time::Instant::now();
-                let _since_last = last_at.elapsed();
-                let _reception_time = simulation_start.elapsed();
-                last_at = start;
-                user_request.received_at = Some(start);
+        let mut collect_result = |workers: &mut Vec<Option<UserRequest>>, (finished_worker, finished_at, ping_lasted)| {
+            let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
+            assert!(worker.is_some()); // must be not available yet. WTF with type???
+            let mut user_request = worker.take().unwrap();
+            user_request.finished_at = Some(finished_at);
+            user_request.ping_lasted = Some(ping_lasted);
+            processed_user_requests.push(user_request);
+        };
 
-                // Check for workers that have finished
-                let exist_available_worker = workers.iter().any(|&r| r.is_none());
-                // TODO: duplicate code follows
-                if !exist_available_worker {
-                    // ... then unconditionally must wait for at least one to finish
-                    let waiting_start = time::Instant::now();
-                    let (finished_worker, finished_at, ping_lasted) = counter_rx.recv().expect("counter rx logic failure");
-                    println!("No available workers, waiting for {} micros...", waiting_start.elapsed().as_micros());
-                    let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
-                    assert!(worker.is_some()); // must be not available yet. WTF with type???
-                    let mut user_request = worker.take().unwrap();
-                    user_request.finished_at = Some(finished_at);
-                    user_request.ping_lasted = Some(ping_lasted);
-                    processed_user_requests.push(user_request);
-                }
-                // Try to collect others but do not block
-                while let Ok((finished_worker, finished_at, ping_lasted)) = counter_rx.try_recv() {
-                    let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
-                    assert!(worker.is_some()); // must be not available yet. WTF with type???
-                    let mut user_request = worker.take().unwrap();
-                    user_request.finished_at = Some(finished_at);
-                    user_request.ping_lasted = Some(ping_lasted);
-                    processed_user_requests.push(user_request);
-                }
+        while let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
+            let start = time::Instant::now();
+            let _since_last = last_at.elapsed();
+            let _reception_time = simulation_start.elapsed();
+            last_at = start;
+            user_request.received_at = Some(start);
 
-                // Choose worker to do the job
-                let available_workers = workers.iter().enumerate()
-                    .filter(|(_i, &user_request)| user_request.is_none())
-                    .collect::<Vec<_>>(); // TODO: do we need Vec???
-                assert!(available_workers.len() > 0); // because we have specifically waited for at least one to finish
-                // XXX: for now, pick the first available worker, as they are sorted
-                // lowest to highest response time.
-                let (chosen_worker, _) = available_workers[0];
-                println!("Choosing worker {}", chosen_worker);
-                user_request.assigned_at = Some(time::Instant::now());
-                user_request.processed_at_worker = Some(chosen_worker);
-                workers[chosen_worker] = Some(user_request);
-                let inner_counter_tx = counter_tx.clone();
-                let Database { client, .. } = &dbs[chosen_worker];
-                let _t = scope.spawn(move |_| {
-                    // Process here
-                    // thread::sleep(time::Duration::from_millis(chosen_worker as u64 * 300 + 300));
-                    let ping_lasted = block_on(ping(&client)).expect("failed ping");
-
-                    let finish = time::Instant::now();
-                    // Report that this worker has finished and is free now
-                    inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
-                });
-
-                let _elapsed_micros = start.elapsed().as_micros();
-                // print!("[Since last = {:>5} millis]\t", since_last.as_millis());
-                // print!("At {:>6}ms got request from {} to project {:<16}", reception_time.as_millis(), id, project_names[project_id]);
-                // println!("[processed in {:>5} micros]", elapsed_micros);
-            } else {
-                break;
+            // Check for workers that have finished
+            let exist_available_worker = workers.iter().any(|&r| r.is_none());
+            if !exist_available_worker {
+                // ... then unconditionally must wait for at least one to finish
+                let waiting_start = time::Instant::now();
+                let result = counter_rx.recv().expect("counter rx logic failure");
+                println!("No available workers, waiting for {} micros...", waiting_start.elapsed().as_micros());
+                collect_result(&mut workers, result);
             }
+            // Try to collect others but do not block
+            while let Ok(result) = counter_rx.try_recv() {
+                collect_result(&mut workers, result);
+            }
+
+            // Choose worker to do the job
+            let available_workers = workers.iter().enumerate()
+                .filter(|(_i, &user_request)| user_request.is_none())
+                .collect::<Vec<_>>(); // TODO: do we need Vec???
+            assert!(available_workers.len() > 0); // because we have specifically waited for at least one to finish
+            // XXX: for now, pick the first available worker, as they are sorted
+            // lowest to highest response time.
+            let (chosen_worker, _) = available_workers[0];
+            println!("Choosing worker {}", chosen_worker);
+            user_request.assigned_at = Some(time::Instant::now());
+            user_request.processed_at_worker = Some(chosen_worker);
+            workers[chosen_worker] = Some(user_request);
+            let inner_counter_tx = counter_tx.clone();
+            let Database { client, .. } = &dbs[chosen_worker];
+            let _t = scope.spawn(move |_| {
+                // Process here
+                // thread::sleep(time::Duration::from_millis(chosen_worker as u64 * 300 + 300));
+                let ping_lasted = block_on(ping(&client)).expect("failed ping");
+
+                let finish = time::Instant::now();
+                // Report that this worker has finished and is free now
+                inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
+            });
+
+            let _elapsed_micros = start.elapsed().as_micros();
+            // print!("[Since last = {:>5} millis]\t", since_last.as_millis());
+            // print!("At {:>6}ms got request from {} to project {:<16}", reception_time.as_millis(), id, project_names[project_id]);
+            // println!("[processed in {:>5} micros]", elapsed_micros);
+        }
+
+        // Collect the remaining ones still trapped in the system
+        let remaining_amount = workers.iter().filter(|&r| r.is_some()).count();
+        for _ in 0..remaining_amount {
+            let result = counter_rx.recv().expect("counter rx logic failure");
+            collect_result(&mut workers, result);
         }
     }).expect("crossbeam scope unwrap failure");
 
