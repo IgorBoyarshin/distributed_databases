@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![feature(destructuring_assignment)]
+#![feature(duration_zero)]
+#![feature(duration_saturating_ops)]
 
 
 use mongodb::{
@@ -217,17 +219,33 @@ async fn ping_multiple(client: &Client) -> Result<Vec<time::Duration>> {
 }
 
 async fn determine_ping(client: &Client) -> Result<time::Duration> {
-    todo!();
+    // Warm up
+    let count = 2;
+    for _ in 0..count {
+        // Ignore output
+        let _duration = ping(&client).await?;
+        // println!("Have warm {}", _duration.as_millis());
+    }
+    // Average
+    let count = 5;
+    let mut sum = time::Duration::ZERO;
+    for _ in 0..count {
+        let duration = ping(&client).await?;
+        sum = sum.saturating_add(duration);
+        // println!("Have avg {}", duration.as_millis());
+    }
+    Ok(sum.div_f32(count as f32))
 }
 // ============================================================================
 // ============================================================================
 // ============================================================================
 struct SimulationHyperParameters {
     request_amount: usize,
-    input_intensity: f32,
+    input_intensity: Option<f32>,
     dbs: Vec<Database>,
     project_names: Vec<&'static str>,
     users: Vec<User>,
+    first_sort_by_ping: bool,
 }
 
 struct SimulationParameters {
@@ -242,10 +260,36 @@ struct SimulationOutput {
 
 async fn simulate(
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
-        SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names: _, dbs }: SimulationHyperParameters) -> Result<SimulationOutput> {
-    println!(":> Starting simulation...");
+        SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names: _, mut dbs, first_sort_by_ping }: SimulationHyperParameters) -> Result<SimulationOutput> {
+    println!(":> Preparing simulation");
     let (spawner_tx, spawner_rx) = channel();
 
+    if first_sort_by_ping {
+        println!(":> Sorting DBs based on ping...");
+        // Collect ping in parallel
+        // let pings = try_join_all(dbs.iter().map(|db| determine_ping(&db.client))).await?.into_iter().map(|d| d.as_millis()).collect::<Vec<_>>();
+        // Parallel ping seems to give skewed results. As this procedure is not
+        // that long and is done only once, we don't mind waiting a bit for sequential ping.
+
+        // Collect ping sequentiall y
+        let mut pings = Vec::with_capacity(dbs.len());
+        for db in dbs.iter() {
+            pings.push(determine_ping(&db.client).await?.as_millis());
+        }
+
+        dbs = {
+            let mut dbs = dbs.into_iter().enumerate().collect::<Vec<_>>();
+            dbs.sort_by(|&(i1, _), &(i2, _)| pings[i1].cmp(&pings[i2]));
+            print!("Will use such order: ");
+            for (i, db) in dbs.iter() {
+                print!("{}({}ms); ", db.name, pings[*i]);
+            }
+            println!();
+            dbs.into_iter().map(|(_, db)| db).collect::<Vec<_>>()
+        };
+        println!();
+    }
+ 
     // Responsible for spawning UserRequests
     thread::spawn(move|| {
         let mut time = 0;
@@ -261,10 +305,12 @@ async fn simulate(
             let request = UserRequest::new(user.id, project_id, time::Instant::now());
             spawner_tx.send(Some(request)).unwrap();
 
-            // Go to sleep
-            let e = 2.71828f32;
-            let sleep_duration = input_intensity * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
-            thread::sleep(time::Duration::from_millis(sleep_duration as u64));
+            if let Some(input_intensity) = input_intensity {
+                // Go to sleep
+                let e = 2.71828f32;
+                let sleep_duration = input_intensity * e.powf(-2f32 * rand::thread_rng().sample::<f32, _>(Open01));
+                thread::sleep(time::Duration::from_millis(sleep_duration as u64));
+            }
 
             time += 1;
 
@@ -278,6 +324,7 @@ async fn simulate(
 
 
     // Responsible for processing UserRequests
+    println!(":> Starting simulation");
     let simulation_start = time::Instant::now();
     let mut last_at = time::Instant::now();
     let mut workers: Vec<Option<UserRequest>> = Vec::with_capacity(dbs.len());
@@ -336,7 +383,7 @@ async fn simulate(
                 let Database { client, .. } = &dbs[chosen_worker];
                 let _t = scope.spawn(move |_| {
                     // Process here
-                    thread::sleep(time::Duration::from_millis(chosen_worker as u64 * 300 + 300));
+                    // thread::sleep(time::Duration::from_millis(chosen_worker as u64 * 300 + 300));
                     let ping_lasted = block_on(ping(&client)).expect("failed ping");
 
                     let finish = time::Instant::now();
@@ -432,11 +479,13 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
     let users = User::create_users(5, projects_count, projects_per_user);
 
     Ok(SimulationHyperParameters {
-        request_amount: 32,
-        input_intensity: 500.0,
+        request_amount: 256,
+        // input_intensity: None,
+        input_intensity: Some(100.0),
         dbs,
         project_names,
         users,
+        first_sort_by_ping: true,
     })
 }
 
@@ -454,22 +503,41 @@ fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &
 }
 
 fn describe_simulation_output(SimulationOutput{ duration, processed_user_requests }: &SimulationOutput) {
-    println!(":> Simulation finished in {} seconds", duration.as_secs());
     println!(":> Processed UserRequests statistics:");
+    let mut average_total_time = 0;
+    let mut average_waiting_time = 0;
     for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, .. } in processed_user_requests {
         let received_at = received_at.expect("empty time Option while describing processed request");
         let assigned_at = assigned_at.expect("empty time Option while describing processed request");
         let finished_at = finished_at.expect("empty time Option while describing processed request");
         let processed_at_worker = processed_at_worker.expect("empty num Option while describing processed request");
         let ping_lasted = ping_lasted.expect("empty ping Option while describing processed request");
-        println!("Received after {:>7} micros, assigned after {:>8} micros, finished after {:>5} millis, processed at {}, ping lasted {}ms",
-            received_at.duration_since(*created_at).as_micros(),
-            assigned_at.duration_since(*created_at).as_micros(),
-            finished_at.duration_since(*created_at).as_millis(),
+
+        let into_system_after = received_at.duration_since(*created_at).as_micros();
+        let waiting_time = assigned_at.duration_since(received_at).as_millis();
+        let total_time = finished_at.duration_since(received_at).as_millis();
+        average_total_time += total_time;
+        average_waiting_time += waiting_time;
+        println!("Got into system after {:>7} micros, Waited for {:>7} millis, totally processed in {:>8} millis, processed at {}, ping lasted {}ms",
+            into_system_after,
+            waiting_time,
+            total_time,
             processed_at_worker,
             ping_lasted.as_millis(),
         );
+        // println!("Received after {:>7} micros, assigned after {:>8} micros, finished after {:>5} millis, processed at {}, ping lasted {}ms",
+        //     received_at.duration_since(*created_at).as_micros(),
+        //     assigned_at.duration_since(*created_at).as_micros(),
+        //     finished_at.duration_since(*created_at).as_millis(),
+        //     processed_at_worker,
+        //     ping_lasted.as_millis(),
+        // );
     }
+    average_total_time   /= processed_user_requests.len() as u128;
+    average_waiting_time /= processed_user_requests.len() as u128;
+    println!(":> Simulation finished in {} millis", duration.as_millis());
+    println!("Average total processing time = {}", average_total_time);
+    println!("Average waiting time = {}", average_waiting_time);
     println!();
 }
 
