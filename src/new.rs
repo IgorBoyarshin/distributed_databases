@@ -244,8 +244,28 @@ async fn determine_ping(client: &Client) -> Result<time::Duration> {
 // ============================================================================
 // ============================================================================
 struct Library {
-    dbs_for_user: Vec<usize>,
+    dbs_for_user: HashMap<UserId, Vec<usize>>,
 }
+
+impl Library {
+    fn new() -> Library {
+        Library {
+            dbs_for_user: HashMap::new(),
+        }
+    }
+
+    fn registered_user(&self, user_id: UserId) -> bool {
+        self.dbs_for_user.contains_key(&user_id)
+    }
+
+    fn register_new_user(&mut self, user_id: UserId, db_id: usize) {
+        self.dbs_for_user.insert(user_id, vec![db_id]);
+    }
+}
+
+// struct DatabaseStat {
+//
+// }
 
 struct SimulationHyperParameters {
     request_amount: usize,
@@ -312,6 +332,8 @@ async fn simulate(
     let mut workers = vec![None; dbs.len()]; // all are available at the beginning
     let mut processed_user_requests = Vec::new();
     let (counter_tx, counter_rx) = channel();
+    let mut library = Library::new();
+    let mut requests_count_of_worker = vec![0; dbs.len()];
     crossbeam_utils::thread::scope(|scope| {
         let mut collect_result = |workers: &mut Vec<Option<UserRequest>>, (finished_worker, finished_at, ping_lasted)| {
             let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
@@ -322,16 +344,25 @@ async fn simulate(
             processed_user_requests.push(user_request);
         };
 
+        // Receive incoming UserRequest
         let mut iteration = 0;
         while let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
             print!("\rIteration [{}]", iteration);
             iteration += 1;
 
+            if !library.registered_user(user_request.user_id) {
+                // Choose the worker based on its worktime = processed_count / processing_intensity
+                let (db_id, _) = requests_count_of_worker.iter().enumerate()
+                    .map(|(i, count)| (i, count * dbs[i].ping_millis))
+                    .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator");
+                library.register_new_user(user_request.user_id, db_id);
+            }
+
             let start = time::Instant::now();
             user_request.received_at = Some(start);
             if input_intensity.is_none() {
                 // Means we want to test the maximum system throughput, thus it
-                // makes sense to set the creation_time as the reception_time (now),
+                // makes sense to (re)set the creation_time as the reception_time (now),
                 // even though *technically* they were all created almost simultaniously
                 // a long time ago.
                 // In this scenario, the processing intensity of the system should
@@ -366,6 +397,7 @@ async fn simulate(
             // println!("Choosing worker {}", chosen_worker);
             user_request.assigned_at = Some(time::Instant::now());
             user_request.processed_at_worker = Some(chosen_worker);
+            requests_count_of_worker[chosen_worker] += 1;
             workers[chosen_worker] = Some(user_request);
             let inner_counter_tx = counter_tx.clone();
             let Database { client, .. } = &dbs[chosen_worker];
