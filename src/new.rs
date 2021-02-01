@@ -331,7 +331,8 @@ async fn simulate(
     let simulation_start = time::Instant::now();
     let mut workers = vec![None; dbs.len()]; // all are available at the beginning
     let mut processed_user_requests = Vec::new();
-    let (counter_tx, counter_rx) = channel();
+    type WorkerResult = (usize, time::Instant, time::Duration);
+    let (counter_tx, counter_rx) = channel::<WorkerResult>();
     let mut library = Library::new();
     let mut requests_count_of_worker = vec![0; dbs.len()];
     crossbeam_utils::thread::scope(|scope| {
@@ -350,14 +351,6 @@ async fn simulate(
             print!("\rIteration [{}]", iteration);
             iteration += 1;
 
-            if !library.registered_user(user_request.user_id) {
-                // Choose the worker based on its worktime = processed_count / processing_intensity
-                let (db_id, _) = requests_count_of_worker.iter().enumerate()
-                    .map(|(i, count)| (i, count * dbs[i].ping_millis))
-                    .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator");
-                library.register_new_user(user_request.user_id, db_id);
-            }
-
             let start = time::Instant::now();
             user_request.received_at = Some(start);
             if input_intensity.is_none() {
@@ -372,29 +365,63 @@ async fn simulate(
                 user_request.created_at = start;
             }
 
-            // Check for workers that have finished
-            let exist_available_worker = workers.iter().any(|&r| r.is_none());
-            if !exist_available_worker {
-                // ... then unconditionally must wait for at least one to finish
-                // let waiting_start = time::Instant::now();
-                let result = counter_rx.recv().expect("counter rx logic failure");
-                // println!("No available workers, waiting for {} micros...", waiting_start.elapsed().as_micros());
-                collect_result(&mut workers, result);
+            // A new User?
+            if !library.registered_user(user_request.user_id) {
+                // Choose the worker based on its worktime = processed_count / processing_intensity
+                let (db_id, _) = requests_count_of_worker.iter().enumerate()
+                    .map(|(i, count)| (i, count * dbs[i].ping_millis))
+                    .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator");
+                library.register_new_user(user_request.user_id, db_id);
             }
+
+            // Workers that contain this User's data, so only these Workers can process this request
+            let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
+            let worker_opt = workers.iter().enumerate()
+                .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
+                .next()
+                .map(|(i, _)| i);
+            let chosen_worker = if let Some(worker) = worker_opt { worker } else {
+                loop {
+                    println!("Waiting for the proper worker to show up...");
+                    let result = counter_rx.recv().expect("counter rx logic failure");
+                    let finished_worker = result.0;
+                    collect_result(&mut workers, result);
+                    if able_worker_ids.contains(&finished_worker) {
+                        break finished_worker;
+                    }
+                }
+            };
             // Try to collect others but do not block
             while let Ok(result) = counter_rx.try_recv() {
                 collect_result(&mut workers, result);
             }
 
-            // Choose worker to do the job
-            let available_workers = workers.iter().enumerate()
-                .filter(|(_i, &user_request)| user_request.is_none())
-                .collect::<Vec<_>>(); // TODO: do we need Vec???
-            assert!(available_workers.len() > 0); // because we have specifically waited for at least one to finish
-            // XXX: for now, pick the first available worker, as they are sorted
-            // lowest to highest response time.
-            let (chosen_worker, _) = available_workers[0];
-            // println!("Choosing worker {}", chosen_worker);
+
+
+
+            // // Check for workers that have finished
+            // let exist_available_worker = workers.iter().any(|&r| r.is_none());
+            // if !exist_available_worker {
+            //     // ... then unconditionally must wait for at least one to finish
+            //     // let waiting_start = time::Instant::now();
+            //     let result = counter_rx.recv().expect("counter rx logic failure");
+            //     // println!("No available workers, waiting for {} micros...", waiting_start.elapsed().as_micros());
+            //     collect_result(&mut workers, result);
+            // }
+            // // Try to collect others but do not block
+            // while let Ok(result) = counter_rx.try_recv() {
+            //     collect_result(&mut workers, result);
+            // }
+            //
+            // // Choose worker to do the job
+            // let available_workers = workers.iter().enumerate()
+            //     .filter(|(_i, &user_request)| user_request.is_none())
+            //     .collect::<Vec<_>>(); // TODO: do we need Vec???
+            // assert!(available_workers.len() > 0); // because we have specifically waited for at least one to finish
+            // // XXX: for now, pick the first available worker, as they are sorted
+            // // lowest to highest response time.
+            // let chosen_worker: usize = available_workers[0].0;
+            println!("Choosing worker {}", chosen_worker);
             user_request.assigned_at = Some(time::Instant::now());
             user_request.processed_at_worker = Some(chosen_worker);
             requests_count_of_worker[chosen_worker] += 1;
@@ -529,7 +556,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 512,
+        request_amount: 128,
         // input_intensity: None,
         input_intensity: Some(0.95 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -563,7 +590,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
     let mut worker_usage_count = Vec::new(); // TODO: emperically determines amount of workers
-    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, .. } in processed_user_requests {
+    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, .. } in processed_user_requests {
         let received_at = received_at.expect("empty time Option while describing processed request");
         let assigned_at = assigned_at.expect("empty time Option while describing processed request");
         let finished_at = finished_at.expect("empty time Option while describing processed request");
@@ -574,8 +601,9 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let total_time = finished_at.duration_since(received_at).as_millis();
         average_total_time += total_time;
         average_waiting_time += waiting_time;
-        println!("[{}] Waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        println!("Request [{}] from {} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
+            user_id,
             waiting_time,
             total_time,
             processed_at_worker,
