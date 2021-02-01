@@ -172,7 +172,7 @@ type Counter = usize;
 // #[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 #[derive(Debug, Copy, Clone)]
 struct UserRequest {
-    id: UserId,
+    user_id: UserId,
     project_id: ProjectId,
     created_at: time::Instant,
     received_at: Option<time::Instant>,
@@ -180,20 +180,24 @@ struct UserRequest {
     finished_at: Option<time::Instant>,
     processed_at_worker: Option<usize>,
     ping_lasted: Option<time::Duration>,
+    id: usize,
     // from: Location,
     // operation: Operation,
     // time: Time,
 }
 
+// struct ProcessedUserRequest {}
+
 impl UserRequest {
-    fn new(id: UserId, project_id: ProjectId, created_at: time::Instant) -> UserRequest {
+    fn new(user_id: UserId, project_id: ProjectId, created_at: time::Instant, id: usize) -> UserRequest {
         UserRequest {
-            id, project_id, created_at,
+            user_id, project_id, created_at,
             received_at: None,
             assigned_at: None,
             finished_at: None,
             processed_at_worker: None,
             ping_lasted: None,
+            id,
         }
     }
 }
@@ -239,6 +243,10 @@ async fn determine_ping(client: &Client) -> Result<time::Duration> {
 // ============================================================================
 // ============================================================================
 // ============================================================================
+struct Library {
+    dbs_for_user: Vec<usize>,
+}
+
 struct SimulationHyperParameters {
     request_amount: usize,
     input_intensity: Option<f32>,
@@ -265,6 +273,7 @@ async fn simulate(
     println!(":> Preparing simulation");
     let (spawner_tx, spawner_rx) = channel();
 
+
     // Responsible for spawning UserRequests
     thread::spawn(move|| {
         let mut time = 0;
@@ -277,7 +286,7 @@ async fn simulate(
             let project_id = user.gen();
 
             // Send for execution
-            let request = UserRequest::new(user.id, project_id, time::Instant::now());
+            let request = UserRequest::new(user.id, project_id, time::Instant::now(), time);
             spawner_tx.send(Some(request)).unwrap();
 
             if let Some(input_intensity) = input_intensity {
@@ -300,10 +309,7 @@ async fn simulate(
     // Responsible for processing UserRequests
     println!(":> Starting simulation");
     let simulation_start = time::Instant::now();
-    let mut workers: Vec<Option<UserRequest>> = Vec::with_capacity(dbs.len());
-    for _ in 0..dbs.len() {
-        workers.push(None); // all are available at the beginning
-    }
+    let mut workers = vec![None; dbs.len()]; // all are available at the beginning
     let mut processed_user_requests = Vec::new();
     let (counter_tx, counter_rx) = channel();
     crossbeam_utils::thread::scope(|scope| {
@@ -525,7 +531,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
     let mut worker_usage_count = Vec::new(); // TODO: emperically determines amount of workers
-    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, .. } in processed_user_requests {
+    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, .. } in processed_user_requests {
         let received_at = received_at.expect("empty time Option while describing processed request");
         let assigned_at = assigned_at.expect("empty time Option while describing processed request");
         let finished_at = finished_at.expect("empty time Option while describing processed request");
@@ -536,7 +542,8 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let total_time = finished_at.duration_since(received_at).as_millis();
         average_total_time += total_time;
         average_waiting_time += waiting_time;
-        println!("Waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        println!("[{}] Waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+            id,
             waiting_time,
             total_time,
             processed_at_worker,
