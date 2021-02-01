@@ -245,7 +245,7 @@ struct SimulationHyperParameters {
     dbs: Vec<Database>,
     project_names: Vec<&'static str>,
     users: Vec<User>,
-    first_sort_by_ping: bool,
+    synchronize_db_changes: bool,
 }
 
 struct SimulationParameters {
@@ -260,36 +260,11 @@ struct SimulationOutput {
 
 async fn simulate(
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
-        SimulationHyperParameters{ input_intensity, request_amount, mut users, project_names: _, mut dbs, first_sort_by_ping }: SimulationHyperParameters) -> Result<SimulationOutput> {
+        SimulationHyperParameters{ input_intensity, request_amount, mut users,
+            project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> Result<SimulationOutput> {
     println!(":> Preparing simulation");
     let (spawner_tx, spawner_rx) = channel();
 
-    if first_sort_by_ping {
-        println!(":> Sorting DBs based on ping...");
-        // Collect ping in parallel
-        // let pings = try_join_all(dbs.iter().map(|db| determine_ping(&db.client))).await?.into_iter().map(|d| d.as_millis()).collect::<Vec<_>>();
-        // Parallel ping seems to give skewed results. As this procedure is not
-        // that long and is done only once, we don't mind waiting a bit for sequential ping.
-
-        // Collect ping sequentiall y
-        let mut pings = Vec::with_capacity(dbs.len());
-        for db in dbs.iter() {
-            pings.push(determine_ping(&db.client).await?.as_millis());
-        }
-
-        dbs = {
-            let mut dbs = dbs.into_iter().enumerate().collect::<Vec<_>>();
-            dbs.sort_by(|&(i1, _), &(i2, _)| pings[i1].cmp(&pings[i2]));
-            print!("Will use such order: ");
-            for (i, db) in dbs.iter() {
-                print!("{}({}ms); ", db.name, pings[*i]);
-            }
-            println!();
-            dbs.into_iter().map(|(_, db)| db).collect::<Vec<_>>()
-        };
-        println!();
-    }
- 
     // Responsible for spawning UserRequests
     thread::spawn(move|| {
         let mut time = 0;
@@ -422,6 +397,7 @@ async fn simulate(
 struct Database {
     client: Client,
     name: &'static str,
+    ping_millis: Time,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -461,22 +437,26 @@ async fn dump_to_str(client: &Client) -> Result<String> {
 // ============================================================================
 // ============================================================================
 async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
-    let dbs = vec![
+    let mut dbs = vec![
         Database {
             client: Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
             name: "Christmas Tree",
+            ping_millis: 0,
         },
         Database {
             client: Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
             name: "Orange Tree",
+            ping_millis: 0,
         },
         Database {
             client: Client::with_uri_str(env::var("MONGO_LEMON").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
             name: "Lemon Tree",
+            ping_millis: 0,
         },
         Database {
             client: Client::with_uri_str(env::var("MONGO_MAPLE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
             name: "Maple Tree",
+            ping_millis: 0,
         },
     ];
     let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
@@ -488,17 +468,37 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
     // we would like all simulation to be conducted with the same set of users.
     let users = User::create_users(5, projects_count, projects_per_user);
 
-    // let processing_intensity = 4.0 / (0.042 + 0.057 + 0.132 + 0.264);
-    let processing_intensity = 1.0/0.042 + 1.0/0.057 + 1.0/0.132 + 1.0/0.264;
+
+    println!(":> Determining ping to DBs...");
+    // Parallel ping seems to give skewed results. As this procedure is not that
+    // long and is done only once, we don't mind waiting a bit for sequential ping.
+    for db in dbs.iter_mut() {
+        db.ping_millis = determine_ping(&db.client).await?.as_millis();
+    }
+
+    println!(":> Sorting DBs based on ping");
+    dbs.sort_by(|Database{ ping_millis: p1, ..}, Database{ ping_millis: p2, ..}| p1.cmp(p2));
+    print!("Will use such order: ");
+    for db in dbs.iter() {
+        print!("{}({}ms); ", db.name, db.ping_millis);
+    }
+    println!();
+
+    let max_processing_intensity = dbs.iter()
+        .map(|db| db.ping_millis)
+        .fold(0.0, |acc, x| acc + 1000.0 / (x as f32));
+    println!(":> Max processing intensity of the system is {} requests per second ({} millis per request)",
+        max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
+
     Ok(SimulationHyperParameters {
-        request_amount: 2048,
+        request_amount: 512,
         // input_intensity: None,
-        input_intensity: Some(0.95 * processing_intensity),
+        input_intensity: Some(0.95 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
         dbs,
         project_names,
         users,
-        first_sort_by_ping: true,
+        synchronize_db_changes: false,
     })
 }
 
@@ -559,15 +559,6 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Usage count of workers: {:?}", worker_usage_count);
     println!();
 }
-
-async fn perform_ping_test(dbs: &Vec<Database>) -> Result<Vec<time::Duration>> {
-    println!(":> Performing ping test...");
-    let (pings_1, pings_2) = try_join!(ping_multiple(&dbs[0].client), ping_multiple(&dbs[1].client))?;
-    println!("Client 1 pings = {:?}ms", pings_1.into_iter().map(|v| v.as_millis()).collect::<Vec<_>>());
-    println!("Client 2 pings = {:?}ms", pings_2.into_iter().map(|v| v.as_millis()).collect::<Vec<_>>());
-    println!();
-    Ok(Vec::new())
-}
 // ============================================================================
 // ============================================================================
 // ============================================================================
@@ -577,7 +568,6 @@ async fn main() -> Result<()> {
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
-    // perform_ping_test(&hyperparameters.dbs).await?;
 
     let output = simulate(parameters, hyperparameters).await?;
 
