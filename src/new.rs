@@ -254,12 +254,16 @@ impl Library {
         }
     }
 
-    fn registered_user(&self, user_id: UserId) -> bool {
+    fn user_registered(&self, user_id: UserId) -> bool {
         self.dbs_for_user.contains_key(&user_id)
     }
 
     fn register_new_user(&mut self, user_id: UserId, db_id: usize) {
         self.dbs_for_user.insert(user_id, vec![db_id]);
+    }
+
+    fn spread_user(&mut self, user_id: UserId, db_id: usize) {
+        self.dbs_for_user.get_mut(&user_id).expect("invalid ID").push(db_id); // TODO: check for uniqueness
     }
 }
 
@@ -287,7 +291,7 @@ struct SimulationOutput {
 }
 
 async fn simulate(
-        SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
+        SimulationParameters{ spread_rate, decay_rate: _ }: SimulationParameters,
         SimulationHyperParameters{ input_intensity, request_amount, mut users,
             project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> Result<SimulationOutput> {
     println!(":> Preparing simulation");
@@ -334,7 +338,7 @@ async fn simulate(
     type WorkerResult = (usize, time::Instant, time::Duration);
     let (counter_tx, counter_rx) = channel::<WorkerResult>();
     let mut library = Library::new();
-    let mut requests_count_of_worker = vec![0; dbs.len()];
+    let mut requests_count_of_worker = vec![0u32; dbs.len()];
     crossbeam_utils::thread::scope(|scope| {
         let mut collect_result = |workers: &mut Vec<Option<UserRequest>>, (finished_worker, finished_at, ping_lasted)| {
             let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
@@ -343,6 +347,17 @@ async fn simulate(
             user_request.finished_at = Some(finished_at);
             user_request.ping_lasted = Some(ping_lasted);
             processed_user_requests.push(user_request);
+        };
+
+        let mut last_waiting_time_i = 0;
+        let mut last_waiting_time = vec![0; 4]; // TODO: @hyper
+
+        let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
+            // worktime = processed_count / processing_intensity
+            requests_count.iter().enumerate()
+                .map(|(i, &count)| (i, count as Time * dbs[i].ping_millis))
+                .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator")
+                .0
         };
 
         // Receive incoming UserRequest
@@ -366,11 +381,8 @@ async fn simulate(
             }
 
             // A new User?
-            if !library.registered_user(user_request.user_id) {
-                // Choose the worker based on its worktime = processed_count / processing_intensity
-                let (db_id, _) = requests_count_of_worker.iter().enumerate()
-                    .map(|(i, count)| (i, count * dbs[i].ping_millis))
-                    .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator");
+            if !library.user_registered(user_request.user_id) {
+                let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
                 library.register_new_user(user_request.user_id, db_id);
             }
 
@@ -382,7 +394,7 @@ async fn simulate(
                 .map(|(i, _)| i);
             let chosen_worker = if let Some(worker) = worker_opt { worker } else {
                 loop {
-                    println!("Waiting for the proper worker to show up...");
+                    // println!("Waiting for the proper worker to show up...");
                     let result = counter_rx.recv().expect("counter rx logic failure");
                     let finished_worker = result.0;
                     collect_result(&mut workers, result);
@@ -397,33 +409,30 @@ async fn simulate(
             }
 
 
-
-
-            // // Check for workers that have finished
-            // let exist_available_worker = workers.iter().any(|&r| r.is_none());
-            // if !exist_available_worker {
-            //     // ... then unconditionally must wait for at least one to finish
-            //     // let waiting_start = time::Instant::now();
-            //     let result = counter_rx.recv().expect("counter rx logic failure");
-            //     // println!("No available workers, waiting for {} micros...", waiting_start.elapsed().as_micros());
-            //     collect_result(&mut workers, result);
-            // }
-            // // Try to collect others but do not block
-            // while let Ok(result) = counter_rx.try_recv() {
-            //     collect_result(&mut workers, result);
-            // }
-            //
-            // // Choose worker to do the job
-            // let available_workers = workers.iter().enumerate()
-            //     .filter(|(_i, &user_request)| user_request.is_none())
-            //     .collect::<Vec<_>>(); // TODO: do we need Vec???
-            // assert!(available_workers.len() > 0); // because we have specifically waited for at least one to finish
-            // // XXX: for now, pick the first available worker, as they are sorted
-            // // lowest to highest response time.
-            // let chosen_worker: usize = available_workers[0].0;
-            println!("Choosing worker {}", chosen_worker);
+            // println!("Choosing worker {}", chosen_worker);
             user_request.assigned_at = Some(time::Instant::now());
             user_request.processed_at_worker = Some(chosen_worker);
+
+            let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
+            let avg_waiting_time = last_waiting_time.iter().sum::<Time>() / last_waiting_time.len() as Time;
+            if waiting_time as f32 * spread_rate > avg_waiting_time as f32 {
+                let new_db_id = requests_count_of_worker.iter().enumerate()
+                    .filter(|(i, _)| !able_worker_ids.contains(i)) // only interested in yet unclaimed Workers
+                    .map(|(i, &count)| (i, count as Time * dbs[i].ping_millis))
+                    .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2))
+                    .map(|(i, _)| i);
+                // println!("Because {} > {}", waiting_time as f32 * spread_rate, avg_waiting_time);
+                if let Some(new_db_id) = new_db_id {
+                    println!("Spreading user {} to {}", user_request.user_id, new_db_id);
+                    library.spread_user(user_request.user_id, new_db_id);
+                } else {
+                    println!("Nowhere to spread {}", user_request.user_id);
+                }
+            }
+
+            last_waiting_time[last_waiting_time_i] = waiting_time;
+            last_waiting_time_i = if last_waiting_time_i == (last_waiting_time.len() - 1) { 0 } else { last_waiting_time_i + 1 };
+
             requests_count_of_worker[chosen_worker] += 1;
             workers[chosen_worker] = Some(user_request);
             let inner_counter_tx = counter_tx.clone();
@@ -556,9 +565,9 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 128,
+        request_amount: 256,
         // input_intensity: None,
-        input_intensity: Some(0.95 * max_processing_intensity),
+        input_intensity: Some(0.7 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
         dbs,
         project_names,
@@ -569,14 +578,14 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
 
 fn get_parameters() -> SimulationParameters {
     SimulationParameters {
-        spread_rate: 2.0,
+        spread_rate: 0.7,
         decay_rate: 3.0,
     }
 }
 
-fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &SimulationHyperParameters) {
-    println!(":> Users:");
-    for user in users.iter() { describe_user(&user); }
+fn describe_simulation_hyperparameters(SimulationHyperParameters{ users: _, .. }: &SimulationHyperParameters) {
+    // println!(":> Users:");
+    // for user in users.iter() { describe_user(&user); }
     println!();
 }
 
@@ -601,7 +610,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let total_time = finished_at.duration_since(received_at).as_millis();
         average_total_time += total_time;
         average_waiting_time += waiting_time;
-        println!("Request [{}] from {} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        println!("Request [{:>4}] from {} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
             user_id,
             waiting_time,
