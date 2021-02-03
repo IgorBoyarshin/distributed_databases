@@ -291,6 +291,8 @@ struct SimulationParameters {
 struct SimulationOutput {
     duration: time::Duration,
     processed_user_requests: Vec<UserRequest>,
+    dbs_for_user: HashMap<UserId, Vec<usize>>,
+    average_db_ping_millis: Vec<Time>,
 }
 
 async fn simulate(
@@ -547,7 +549,9 @@ async fn simulate(
     let simulation_duration = simulation_start.elapsed();
     println!();
 
-    Ok(SimulationOutput{ duration: simulation_duration, processed_user_requests })
+    Ok(SimulationOutput{ duration: simulation_duration, processed_user_requests,
+        dbs_for_user: library.dbs_for_user,
+        average_db_ping_millis: dbs.iter().map(|db| db.ping_millis).collect::<Vec<_>>() })
 }
 // ============================================================================
 // ============================================================================
@@ -649,7 +653,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 1 * 512,
+        request_amount: 2 * 512,
         // input_intensity: None,
         input_intensity: Some(0.9 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -673,7 +677,7 @@ fn describe_simulation_hyperparameters(SimulationHyperParameters{ users: _, .. }
     println!();
 }
 
-fn describe_simulation_output(SimulationOutput{ duration, processed_user_requests }: &SimulationOutput) {
+fn describe_simulation_output(SimulationOutput{ duration, processed_user_requests, dbs_for_user, average_db_ping_millis }: &SimulationOutput) {
     /*
      * The (assigned_at - received_at) time generally can never be greater than
      * the waiting time for the fastest worker, so this metric is useless as a
@@ -694,7 +698,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let total_time = finished_at.duration_since(received_at).as_millis();
         average_total_time += total_time;
         average_waiting_time += waiting_time;
-        println!("Request [{:>4}] from {:>5} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        println!("Request [{:>4}] from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
             "#".repeat(*user_id as usize),
             waiting_time,
@@ -717,6 +721,21 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Average total processing time = {} millis", average_total_time);
     println!(":> Average waiting time = {} millis", average_waiting_time);
     println!(":> Usage count of workers: {:?}", worker_usage_count);
+    let db_len = average_db_ping_millis.len();
+    println!(":> Database worktime: {:?}",
+        average_db_ping_millis.into_iter().zip(worker_usage_count.into_iter()).map(|(ping, count)| ping * count as Time).collect::<Vec<_>>());
+    let users_for_db = (0..db_len).into_iter()
+        .map(|i| {
+            let mut res = Vec::new();
+            for (user, dbs) in dbs_for_user.iter() {
+                if dbs.contains(&i) {
+                    res.push(user);
+                }
+            }
+            res
+        }).collect::<Vec<_>>();
+    println!(":> Database usage by users: {:?}", users_for_db);
+
     println!();
 }
 // ============================================================================
