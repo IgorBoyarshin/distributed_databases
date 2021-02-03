@@ -447,7 +447,12 @@ async fn simulate(
             stat.count += 1;
 
             let total_delta: i128 = stat.deltas.iter().sum();
-            if total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
+            let purify = stat.deltas.iter().all(|&d| d > 0);
+            // let purify = {
+            //     let positive_count = stat.deltas.iter().filter(|&d| d > &0).count();
+            //     positive_count >= stat.deltas.len() - 1
+            // };
+            if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
                 // println!("Because total delta {} > 0", total_delta);
                 if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
                     stat.last_change_at = stat.count;
@@ -593,7 +598,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 512,
+        request_amount: 4*512,
         // input_intensity: None,
         input_intensity: Some(0.7 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -640,7 +645,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         average_waiting_time += waiting_time;
         println!("Request [{:>4}] from {:>5} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
-            "#".repeat(*user_id as usize + 1),
+            "#".repeat(*user_id as usize),
             waiting_time,
             total_time,
             processed_at_worker,
