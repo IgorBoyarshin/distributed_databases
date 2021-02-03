@@ -349,9 +349,25 @@ async fn simulate(
             processed_user_requests.push(user_request);
         };
 
-        let mut last_waiting_time_i = 0;
-        let mut last_waiting_time = vec![0; 4]; // TODO: @hyper
+        // ====================================================================
+        // spread_rate parameter utilization logic
+        // let mut last_waiting_time_deltas_i = 0;
+        // let mut last_waiting_time_deltas = vec![0i32; 10]; // TODO: @hyper
+        // let mut last_waiting_time = 0;
+        // let mut last_change_at_iteration = 0;
+        struct WaitingStat {
+            i: usize,
+            count: usize,
+            last_change_at: usize,
+            last_waiting_time: Time,
+            deltas: Vec<i128>,
+        };
+        // impl WaitingStat {
+        //
+        // }
 
+        let mut waiting_stat_for_user = HashMap::new();
+        // ====================================================================
         let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
             // worktime = processed_count / processing_intensity
             requests_count.iter().enumerate()
@@ -359,7 +375,14 @@ async fn simulate(
                 .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator")
                 .0
         };
-
+        let unclaimed_worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>, able_worker_ids: &Vec<usize>| {
+            requests_count.iter().enumerate()
+                .filter(|(i, _)| !able_worker_ids.contains(i)) // only interested in yet unclaimed Workers
+                .map(|(i, &count)| (i, count as Time * dbs[i].ping_millis))
+                .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2))
+                .map(|(i, _)| i)
+        };
+        // ====================================================================
         // Receive incoming UserRequest
         let mut iteration = 0;
         while let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
@@ -380,12 +403,15 @@ async fn simulate(
                 user_request.created_at = start;
             }
 
+            // ================================================================
             // A new User?
             if !library.user_registered(user_request.user_id) {
                 let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
                 library.register_new_user(user_request.user_id, db_id);
+                waiting_stat_for_user.insert(user_request.user_id,
+                    WaitingStat{ i: 0, count: 0, last_change_at: 0, last_waiting_time: 0, deltas: vec![0; 6] }); // @hyper
             }
-
+            // ================================================================
             // Workers that contain this User's data, so only these Workers can process this request
             let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
             let worker_opt = workers.iter().enumerate()
@@ -407,31 +433,32 @@ async fn simulate(
             while let Ok(result) = counter_rx.try_recv() {
                 collect_result(&mut workers, result);
             }
-
-
+            // ================================================================
             // println!("Choosing worker {}", chosen_worker);
             user_request.assigned_at = Some(time::Instant::now());
             user_request.processed_at_worker = Some(chosen_worker);
-
+            // ================================================================
+            let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
             let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
-            let avg_waiting_time = last_waiting_time.iter().sum::<Time>() / last_waiting_time.len() as Time;
-            if waiting_time as f32 * spread_rate > avg_waiting_time as f32 {
-                let new_db_id = requests_count_of_worker.iter().enumerate()
-                    .filter(|(i, _)| !able_worker_ids.contains(i)) // only interested in yet unclaimed Workers
-                    .map(|(i, &count)| (i, count as Time * dbs[i].ping_millis))
-                    .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2))
-                    .map(|(i, _)| i);
-                // println!("Because {} > {}", waiting_time as f32 * spread_rate, avg_waiting_time);
-                if let Some(new_db_id) = new_db_id {
+            let delta = waiting_time as i128 - stat.last_waiting_time as i128;
+            stat.last_waiting_time = waiting_time;
+            stat.deltas[stat.i] = delta;
+            stat.i = (stat.i + 1) % stat.deltas.len();
+            stat.count += 1;
+
+            let total_delta: i128 = stat.deltas.iter().sum();
+            if total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
+                // println!("Because total delta {} > 0", total_delta);
+                if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
+                    stat.last_change_at = stat.count;
                     println!("Spreading user {} to {}", user_request.user_id, new_db_id);
                     library.spread_user(user_request.user_id, new_db_id);
                 } else {
                     println!("Nowhere to spread {}", user_request.user_id);
                 }
             }
+            // ================================================================
 
-            last_waiting_time[last_waiting_time_i] = waiting_time;
-            last_waiting_time_i = if last_waiting_time_i == (last_waiting_time.len() - 1) { 0 } else { last_waiting_time_i + 1 };
 
             requests_count_of_worker[chosen_worker] += 1;
             workers[chosen_worker] = Some(user_request);
@@ -448,6 +475,7 @@ async fn simulate(
         }
         // println!(); // iteration print reset
 
+        // ====================================================================
         // Collect the remaining ones still trapped in the system
         let remaining_amount = workers.iter().filter(|&r| r.is_some()).count();
         for _ in 0..remaining_amount {
@@ -565,7 +593,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 256,
+        request_amount: 512,
         // input_intensity: None,
         input_intensity: Some(0.7 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -578,7 +606,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
 
 fn get_parameters() -> SimulationParameters {
     SimulationParameters {
-        spread_rate: 0.7,
+        spread_rate: 1.0,
         decay_rate: 3.0,
     }
 }
@@ -610,9 +638,9 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let total_time = finished_at.duration_since(received_at).as_millis();
         average_total_time += total_time;
         average_waiting_time += waiting_time;
-        println!("Request [{:>4}] from {} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        println!("Request [{:>4}] from {:>5} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
-            user_id,
+            "#".repeat(*user_id as usize + 1),
             waiting_time,
             total_time,
             processed_at_worker,
