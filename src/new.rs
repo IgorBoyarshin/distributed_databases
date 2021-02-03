@@ -3,6 +3,10 @@
 #![feature(destructuring_assignment)]
 #![feature(duration_zero)]
 #![feature(duration_saturating_ops)]
+#![feature(drain_filter)]
+
+// XXX: needed??
+#![feature(linked_list_remove)]
 
 
 use mongodb::{
@@ -21,6 +25,7 @@ use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
+use std::collections::LinkedList;
 
 use rand::Rng;
 use rand_distr::{Poisson, Distribution};
@@ -350,11 +355,6 @@ async fn simulate(
         };
 
         // ====================================================================
-        // spread_rate parameter utilization logic
-        // let mut last_waiting_time_deltas_i = 0;
-        // let mut last_waiting_time_deltas = vec![0i32; 10]; // TODO: @hyper
-        // let mut last_waiting_time = 0;
-        // let mut last_change_at_iteration = 0;
         type Delta = i128;
         struct WaitingStat {
             i: usize,
@@ -396,14 +396,12 @@ async fn simulate(
                 .map(|(i, _)| i)
         };
         // ====================================================================
-        // Receive incoming UserRequest
-        let mut iteration = 0;
-        while let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
-            print!("\rIteration [{}]", iteration);
-            iteration += 1;
+        // The front has most priority as it has most waiting time
+        let mut queue = LinkedList::new();
 
-            let start = time::Instant::now();
-            user_request.received_at = Some(start);
+        let process_received_user_request = |mut user_request: UserRequest, library: &mut Library,
+                requests_count: &Vec<u32>, dbs: &Vec<Database>, waiting_stat: &mut HashMap<_, _>| {
+            user_request.received_at = Some(time::Instant::now());
             if input_intensity.is_none() {
                 // Means we want to test the maximum system throughput, thus it
                 // makes sense to (re)set the creation_time as the reception_time (now),
@@ -413,94 +411,329 @@ async fn simulate(
                 // be equal both when calculating the actual value (processed amount
                 // divided by time taken) and when calculating the theoretical value
                 // (using average request processing time).
-                user_request.created_at = start;
+                user_request.created_at = time::Instant::now();
             }
-
             // ================================================================
             // A new User?
             if !library.user_registered(user_request.user_id) {
-                let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
+                let db_id = worker_with_least_worktime(&requests_count, &dbs);
                 library.register_new_user(user_request.user_id, db_id);
-                waiting_stat_for_user.insert(user_request.user_id, WaitingStat::new());
+                waiting_stat.insert(user_request.user_id, WaitingStat::new());
+                println!("Registering user {} to {}", user_request.user_id, db_id);
             }
             // ================================================================
-            // Workers that contain this User's data, so only these Workers can process this request
-            let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
-            let worker_opt = workers.iter().enumerate()
-                .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
-                .next()
-                .map(|(i, _)| i);
-            let chosen_worker = if let Some(worker) = worker_opt { worker } else {
-                loop {
-                    // println!("Waiting for the proper worker to show up...");
-                    let result = counter_rx.recv().expect("counter rx logic failure");
-                    let finished_worker = result.0;
-                    collect_result(&mut workers, result);
-                    if able_worker_ids.contains(&finished_worker) {
-                        break finished_worker;
+            user_request
+        };
+
+        let mut iteration = 0;
+        let mut exit_condition = None; // exit on (iteration == Some(sent_requests_count).unwrap())
+        let mut processed_count = 0;
+        let mut received_count = 0;
+        'main: loop {
+            if let Some(sent_count) = exit_condition {
+                if sent_count == processed_count {
+                    break 'main;
+                }
+            } else {
+                // Collect all pending UserRequests, do not block
+                while let Ok(user_request) = spawner_rx.try_recv() {
+                    if let Some(user_request) = user_request {
+                        // println!("Saw pending request {} from {}", user_request.id, user_request.user_id);
+                        queue.push_back(process_received_user_request(user_request, &mut library,
+                                &requests_count_of_worker, &dbs, &mut waiting_stat_for_user));
+                        received_count += 1;
+                    } else {
+                        exit_condition = Some(received_count);
                     }
                 }
-            };
-            // Try to collect others but do not block
-            while let Ok(result) = counter_rx.try_recv() {
-                collect_result(&mut workers, result);
-            }
-            // ================================================================
-            // println!("Choosing worker {}", chosen_worker);
-            user_request.assigned_at = Some(time::Instant::now());
-            user_request.processed_at_worker = Some(chosen_worker);
-            // ================================================================
-            let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
-            let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
-            let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
-            stat.last_waiting_time = waiting_time;
-            stat.put(delta);
-
-            let total_delta: Delta = stat.deltas.iter().sum();
-            let purify = stat.deltas.iter().all(|&d| d > 0);
-            // let purify = {
-            //     let positive_count = stat.deltas.iter().filter(|&d| d > &0).count();
-            //     positive_count >= stat.deltas.len() - 1
-            // };
-            if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
-                // println!("Because total delta {} > 0", total_delta);
-                if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
-                    stat.mark_change();
-                    println!("Spreading user {} to {}", user_request.user_id, new_db_id);
-                    library.spread_user(user_request.user_id, new_db_id);
-                } else {
-                    println!("Nowhere to spread {}", user_request.user_id);
+                if queue.is_empty() {
+                    // Must wait for at least one request to work with, so block
+                    if let Some(user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
+                        // println!("Forcefully waited for request {} from {} because queue is empty", user_request.id, user_request.user_id);
+                        queue.push_back(process_received_user_request(user_request, &mut library,
+                                &requests_count_of_worker, &dbs, &mut waiting_stat_for_user));
+                        received_count += 1;
+                    } else {
+                        exit_condition = Some(received_count);
+                    }
                 }
             }
-            // ================================================================
+
+            // Collect finished workers, do not block
+            while let Ok(result) = counter_rx.try_recv() {
+                // TODO: inline function call
+                collect_result(&mut workers, result);
+                processed_count += 1;
+            }
 
 
-            requests_count_of_worker[chosen_worker] += 1;
-            workers[chosen_worker] = Some(user_request);
-            let inner_counter_tx = counter_tx.clone();
-            let Database { client, .. } = &dbs[chosen_worker];
-            let _t = scope.spawn(move |_| {
-                // Process here
-                let ping_lasted = block_on(ping(&client)).expect("failed ping");
+            // let gonna = queue.iter().any(|user_request| {
+            //     let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
+            //     workers.iter().enumerate()
+            //         .any(|(i, req)| req.is_none() && able_worker_ids.contains(&i))
+            // });
+            // if gonna {
+            //     println!("Available workers = {:?}", workers.iter().enumerate().filter(|(_,w)| w.is_none()).map(|(i,_)| i).collect::<Vec<_>>());
+            //     print!("There are {} requests in queue:", queue.len());
+            //     for UserRequest{id, user_id, ..} in queue.iter() {
+            //         print!("[{} from {}], ", id, user_id);
+            //     }
+            //     println!();
+            // }
 
-                let finish = time::Instant::now();
-                // Report that this worker has finished and is free now
-                inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
-            });
+            // For each UserRequest...
+            // let len_before = queue.len();
+            // let user_request = queue.drain_filter(|user_request| {
+            //     let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
+            //     workers.iter().enumerate()
+            //         .any(|(i, req)| req.is_none() && able_worker_ids.contains(&i))
+            // }).next();
+            // if user_request.is_some() {
+            //     assert_eq!(queue.len(), len_before - 1);
+            // } else {
+            //     assert_eq!(queue.len(), len_before);
+            // }
+
+            let task = queue.iter()
+                // ... get its able_worker_ids ...
+                .map(|r| &library.dbs_for_user[&r.user_id])
+                // ... try to find a fit Worker for it with most priority ...
+                // (a Worker is fit if free && current UserRequest can be processed on it)
+                .map(|able_worker_ids|
+                    workers.iter().enumerate()
+                        .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
+                        .next() // get first (most priority)
+                        .map(|(i, _)| i))
+                .enumerate()
+                // ... interested in UserRequests that currently have a fit Worker ...
+                .filter(|(_, worker_id_opt)| worker_id_opt.is_some())
+                // ... select first (longest in queue, most waiting time)
+                .next()
+                .map(|(i, w)| (i, w.unwrap())); // know it is Option::Some
+            if let Some((user_request_i, chosen_worker)) = task {
+                let mut user_request = queue.remove(user_request_i);
+            // if let Some(mut user_request) = user_request {
+                // println!("Choosing request {} from {}", user_request.id, user_request.user_id);
+                println!("Iteration [{}]", iteration);
+                iteration += 1;
+
+                // let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
+                // let chosen_worker = workers.iter().enumerate()
+                //         .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
+                //         .next() // get first (most priority)
+                //         .unwrap() // know for sure there IS such a worker because we picked the user_request so
+                //         .0; // need just the index
+                // ================================================================
+                // println!("Choosing worker {}", chosen_worker);
+                user_request.assigned_at = Some(time::Instant::now());
+                user_request.processed_at_worker = Some(chosen_worker);
+                requests_count_of_worker[chosen_worker] += 1;
+                // ================================================================
+                let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
+                let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
+                let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
+                stat.last_waiting_time = waiting_time;
+                stat.put(delta);
+
+                let user_id = user_request.user_id;
+                workers[chosen_worker] = Some(user_request);
+                let total_delta: Delta = stat.deltas.iter().sum();
+                let purify = stat.deltas.iter().all(|&d| d > 0);
+                if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
+                    // println!("Because total delta {} > 0", total_delta);
+                    let able_worker_ids = &library.dbs_for_user[&user_id];
+                    if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
+                        stat.mark_change();
+                        println!("Spreading user {} to {}", user_id, new_db_id);
+                        library.spread_user(user_id, new_db_id);
+                    } else {
+                        println!("Nowhere to spread {}", user_id);
+                    }
+                }
+                // ================================================================
+                let inner_counter_tx = counter_tx.clone();
+                let client = &dbs[chosen_worker].client;
+                let _t = scope.spawn(move |_| {
+                    // Process here
+                    let ping_lasted = block_on(ping(&client)).expect("failed ping");
+
+                    let finish = time::Instant::now();
+                    // Report that this worker has finished and is free now
+                    inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
+                });
+                // ================================================================
+            }
+
+
+            // for user_request in queue.iter() {
+            //     let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
+            //     let worker_opt = workers.iter().enumerate()
+            //         .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
+            //         .next() // get first
+            //         .map(|(i, _)| i);
+            //     if let Some(chosen_worker) = worker_opt {
+                    // // ================================================================
+                    // // println!("Choosing worker {}", chosen_worker);
+                    // user_request.assigned_at = Some(time::Instant::now());
+                    // user_request.processed_at_worker = Some(chosen_worker);
+                    // requests_count_of_worker[chosen_worker] += 1;
+                    // // ================================================================
+                    // let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
+                    // let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
+                    // let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
+                    // stat.last_waiting_time = waiting_time;
+                    // stat.put(delta);
+                    //
+                    // let user_id = user_request.user_id;
+                    // workers[chosen_worker] = Some(user_request);
+                    // let total_delta: Delta = stat.deltas.iter().sum();
+                    // let purify = stat.deltas.iter().all(|&d| d > 0);
+                    // if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
+                    //     // println!("Because total delta {} > 0", total_delta);
+                    //     if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
+                    //         stat.mark_change();
+                    //         println!("Spreading user {} to {}", user_id, new_db_id);
+                    //         library.spread_user(user_id, new_db_id);
+                    //     } else {
+                    //         println!("Nowhere to spread {}", user_id);
+                    //     }
+                    // }
+                    // // ================================================================
+                    // let inner_counter_tx = counter_tx.clone();
+                    // let client = &dbs[chosen_worker].client;
+                    // let _t = scope.spawn(move |_| {
+                    //     // Process here
+                    //     let ping_lasted = block_on(ping(&client)).expect("failed ping");
+                    //
+                    //     let finish = time::Instant::now();
+                    //     // Report that this worker has finished and is free now
+                    //     inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
+                    // });
+                    // // ================================================================
+            //     } // else keep searching down the queue
+            // }
         }
-        // println!(); // iteration print reset
+
+        // XXX: collect remaining!!!
+        // XXX: collect remaining!!!
+        // XXX: collect remaining!!!
 
         // ====================================================================
-        // Collect the remaining ones still trapped in the system
-        let remaining_amount = workers.iter().filter(|&r| r.is_some()).count();
-        for _ in 0..remaining_amount {
-            print!("\rIteration [{}]", iteration);
-            iteration += 1;
+        // Collect the remaining UserRequests still being processed in Workers
+        // let remaining_amount = workers.iter().filter(|&r| r.is_some()).count();
+        // println!("Remaining count = {}", remaining_amount);
+        // for _ in 0..remaining_amount {
+        //     println!("Iteration [{}]", iteration);
+        //     iteration += 1;
+        //
+        //     let result = counter_rx.recv().expect("counter rx logic failure");
+        //     collect_result(&mut workers, result);
+        // }
+        // println!(); // iteration print reset
 
-            let result = counter_rx.recv().expect("counter rx logic failure");
-            collect_result(&mut workers, result);
-        }
-        println!(); // iteration print reset
+
+        // // ====================================================================
+        // // Receive incoming UserRequest
+        // let mut iteration = 0;
+        // while let Some(mut user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
+        //     print!("\rIteration [{}]", iteration);
+        //     iteration += 1;
+        //
+        //     let start = time::Instant::now();
+        //     user_request.received_at = Some(start);
+        //     if input_intensity.is_none() {
+        //         // Means we want to test the maximum system throughput, thus it
+        //         // makes sense to (re)set the creation_time as the reception_time (now),
+        //         // even though *technically* they were all created almost simultaniously
+        //         // a long time ago.
+        //         // In this scenario, the processing intensity of the system should
+        //         // be equal both when calculating the actual value (processed amount
+        //         // divided by time taken) and when calculating the theoretical value
+        //         // (using average request processing time).
+        //         user_request.created_at = start;
+        //     }
+        //
+        //     // ================================================================
+        //     // A new User?
+        //     if !library.user_registered(user_request.user_id) {
+        //         let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
+        //         library.register_new_user(user_request.user_id, db_id);
+        //         waiting_stat_for_user.insert(user_request.user_id, WaitingStat::new());
+        //     }
+        //     // ================================================================
+        //     // Workers that contain this User's data, so only these Workers can process this request
+        //     let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
+        //     let worker_opt = workers.iter().enumerate()
+        //         .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
+        //         .next()
+        //         .map(|(i, _)| i);
+        //     let chosen_worker = if let Some(worker) = worker_opt { worker } else {
+        //         loop {
+        //             // println!("Waiting for the proper worker to show up...");
+        //             let result = counter_rx.recv().expect("counter rx logic failure");
+        //             let finished_worker = result.0;
+        //             collect_result(&mut workers, result);
+        //             if able_worker_ids.contains(&finished_worker) {
+        //                 break finished_worker;
+        //             }
+        //         }
+        //     };
+        //     // Try to collect others but do not block
+        //     while let Ok(result) = counter_rx.try_recv() {
+        //         collect_result(&mut workers, result);
+        //     }
+        //     // ================================================================
+        //     // println!("Choosing worker {}", chosen_worker);
+        //     user_request.assigned_at = Some(time::Instant::now());
+        //     user_request.processed_at_worker = Some(chosen_worker);
+        //     requests_count_of_worker[chosen_worker] += 1;
+        //     // ================================================================
+        //     let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
+        //     let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
+        //     let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
+        //     stat.last_waiting_time = waiting_time;
+        //     stat.put(delta);
+        //
+        //     let user_id = user_request.user_id;
+        //     workers[chosen_worker] = Some(user_request);
+        //     let total_delta: Delta = stat.deltas.iter().sum();
+        //     let purify = stat.deltas.iter().all(|&d| d > 0);
+        //     if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
+        //         // println!("Because total delta {} > 0", total_delta);
+        //         if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
+        //             stat.mark_change();
+        //             println!("Spreading user {} to {}", user_id, new_db_id);
+        //             library.spread_user(user_id, new_db_id);
+        //         } else {
+        //             println!("Nowhere to spread {}", user_id);
+        //         }
+        //     }
+        //     // ================================================================
+        //     let inner_counter_tx = counter_tx.clone();
+        //     let client = &dbs[chosen_worker].client;
+        //     let _t = scope.spawn(move |_| {
+        //         // Process here
+        //         let ping_lasted = block_on(ping(&client)).expect("failed ping");
+        //
+        //         let finish = time::Instant::now();
+        //         // Report that this worker has finished and is free now
+        //         inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
+        //     });
+        //     // ================================================================
+        // }
+        // // println!(); // iteration print reset
+
+        // // ====================================================================
+        // // Collect the remaining ones still trapped in the system
+        // let remaining_amount = workers.iter().filter(|&r| r.is_some()).count();
+        // for _ in 0..remaining_amount {
+        //     print!("\rIteration [{}]", iteration);
+        //     iteration += 1;
+        //
+        //     let result = counter_rx.recv().expect("counter rx logic failure");
+        //     collect_result(&mut workers, result);
+        // }
+        // println!(); // iteration print reset
     }).expect("crossbeam scope unwrap failure");
 
     let simulation_duration = simulation_start.elapsed();
@@ -608,7 +841,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 2*512,
+        request_amount: 64,
         // input_intensity: None,
         input_intensity: Some(0.7 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
