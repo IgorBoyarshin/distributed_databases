@@ -291,7 +291,7 @@ struct SimulationOutput {
 }
 
 async fn simulate(
-        SimulationParameters{ spread_rate, decay_rate: _ }: SimulationParameters,
+        SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
         SimulationHyperParameters{ input_intensity, request_amount, mut users,
             project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> Result<SimulationOutput> {
     println!(":> Preparing simulation");
@@ -355,16 +355,29 @@ async fn simulate(
         // let mut last_waiting_time_deltas = vec![0i32; 10]; // TODO: @hyper
         // let mut last_waiting_time = 0;
         // let mut last_change_at_iteration = 0;
+        type Delta = i128;
         struct WaitingStat {
             i: usize,
             count: usize,
             last_change_at: usize,
             last_waiting_time: Time,
-            deltas: Vec<i128>,
+            deltas: Vec<Delta>,
         };
-        // impl WaitingStat {
-        //
-        // }
+        impl WaitingStat {
+            fn put(&mut self, delta: Delta) {
+                self.deltas[self.i] = delta;
+                self.i = (self.i + 1) % self.deltas.len();
+                self.count += 1;
+            }
+
+            fn mark_change(&mut self) {
+                self.last_change_at = self.count;
+            }
+
+            fn new() -> WaitingStat {
+                WaitingStat{ i: 0, count: 0, last_change_at: 0, last_waiting_time: 0, deltas: vec![0; 6] } // @hyper
+            }
+        }
 
         let mut waiting_stat_for_user = HashMap::new();
         // ====================================================================
@@ -408,8 +421,7 @@ async fn simulate(
             if !library.user_registered(user_request.user_id) {
                 let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
                 library.register_new_user(user_request.user_id, db_id);
-                waiting_stat_for_user.insert(user_request.user_id,
-                    WaitingStat{ i: 0, count: 0, last_change_at: 0, last_waiting_time: 0, deltas: vec![0; 6] }); // @hyper
+                waiting_stat_for_user.insert(user_request.user_id, WaitingStat::new());
             }
             // ================================================================
             // Workers that contain this User's data, so only these Workers can process this request
@@ -440,13 +452,11 @@ async fn simulate(
             // ================================================================
             let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
             let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
-            let delta = waiting_time as i128 - stat.last_waiting_time as i128;
+            let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
             stat.last_waiting_time = waiting_time;
-            stat.deltas[stat.i] = delta;
-            stat.i = (stat.i + 1) % stat.deltas.len();
-            stat.count += 1;
+            stat.put(delta);
 
-            let total_delta: i128 = stat.deltas.iter().sum();
+            let total_delta: Delta = stat.deltas.iter().sum();
             let purify = stat.deltas.iter().all(|&d| d > 0);
             // let purify = {
             //     let positive_count = stat.deltas.iter().filter(|&d| d > &0).count();
@@ -455,7 +465,7 @@ async fn simulate(
             if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
                 // println!("Because total delta {} > 0", total_delta);
                 if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
-                    stat.last_change_at = stat.count;
+                    stat.mark_change();
                     println!("Spreading user {} to {}", user_request.user_id, new_db_id);
                     library.spread_user(user_request.user_id, new_db_id);
                 } else {
@@ -598,7 +608,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 4*512,
+        request_amount: 2*512,
         // input_intensity: None,
         input_intensity: Some(0.7 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
