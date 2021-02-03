@@ -265,7 +265,8 @@ impl Library {
     }
 
     fn spread_user(&mut self, user_id: UserId, db_id: usize) {
-        self.dbs_for_user.get_mut(&user_id).expect("invalid ID").push(db_id); // TODO: check for uniqueness
+        assert!(!self.dbs_for_user[&user_id].contains(&db_id));
+        self.dbs_for_user.get_mut(&user_id).expect("invalid ID").push(db_id);
     }
 }
 
@@ -648,7 +649,7 @@ async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 4 * 512,
+        request_amount: 1 * 512,
         // input_intensity: None,
         input_intensity: Some(0.9 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
