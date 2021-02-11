@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
+// #![allow(unused_imports)]
 #![feature(destructuring_assignment)]
 #![feature(duration_zero)]
 #![feature(duration_saturating_ops)]
@@ -10,28 +10,32 @@ use mongodb::{
     bson,
     bson::{doc, Bson},
     // bson::document::Document,
-    error::Result,
+    // error::Result,
     Client
 };
+use mongodb::error::Result as MongoResult;
 use std::env;
 use futures_util::StreamExt;
 // use futures::future::join_all;
 // use futures::join;
-use futures::try_join;
-use futures::future::try_join_all;
+// use futures::try_join;
+// use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 use std::collections::LinkedList;
 
 use rand::Rng;
-use rand_distr::{Poisson, Distribution};
+// use rand_distr::{Poisson, Distribution};
 // use rand_distr::num_traits::Pow;
 use rand::distributions::Open01;
 
 
 use variant_count::VariantCount;
 
+// use std::fs::File;
+// use std::io::Write;
+// use plotters::prelude::{RED, WHITE, ChartBuilder, LineSeries, BitMapBackend};
 
 // use crossbeam_utils;
 use futures::executor::block_on;
@@ -169,7 +173,6 @@ fn describe_user(User{ user_behavior, id, project_ids }: &User) {
 type ProjectId = usize;
 type UserId = u32;
 type Time = u128;
-type Counter = usize;
 
 // #[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 #[derive(Debug, Copy, Clone)]
@@ -206,7 +209,7 @@ impl UserRequest {
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn ping(client: &Client) -> Result<time::Duration> {
+async fn ping(client: &Client) -> MongoResult<time::Duration> {
     let start = time::Instant::now();
     {
         let _names = client.database("users").list_collection_names(None).await?;
@@ -215,7 +218,7 @@ async fn ping(client: &Client) -> Result<time::Duration> {
     Ok(start.elapsed())
 }
 
-async fn ping_multiple(client: &Client) -> Result<Vec<time::Duration>> {
+async fn ping_multiple(client: &Client) -> MongoResult<Vec<time::Duration>> {
     let amount = 10;
     let mut times = Vec::with_capacity(amount);
     for _ in 0..amount {
@@ -224,7 +227,7 @@ async fn ping_multiple(client: &Client) -> Result<Vec<time::Duration>> {
     Ok(times)
 }
 
-async fn determine_ping(client: &Client) -> Result<time::Duration> {
+async fn determine_ping(client: &Client) -> MongoResult<time::Duration> {
     // Warm up
     let count = 1;
     for _ in 0..count {
@@ -264,15 +267,11 @@ impl Library {
         self.dbs_for_user.insert(user_id, vec![db_id]);
     }
 
-    fn spread_user(&mut self, user_id: UserId, db_id: usize) {
+    fn spread_user_to(&mut self, user_id: UserId, db_id: usize) {
         assert!(!self.dbs_for_user[&user_id].contains(&db_id));
         self.dbs_for_user.get_mut(&user_id).expect("invalid ID").push(db_id);
     }
 }
-
-// struct DatabaseStat {
-//
-// }
 
 struct SimulationHyperParameters {
     request_amount: usize,
@@ -295,10 +294,35 @@ struct SimulationOutput {
     average_db_ping_millis: Vec<Time>,
 }
 
+type Delta = i128;
+struct WaitingStat {
+    i: usize,
+    count: usize,
+    last_change_at: usize,
+    last_waiting_time: Time,
+    deltas: Vec<Delta>,
+}
+impl WaitingStat {
+    fn put(&mut self, delta: Delta) {
+        self.deltas[self.i] = delta;
+        self.i = (self.i + 1) % self.deltas.len();
+        self.count += 1;
+    }
+
+    fn mark_change(&mut self) {
+        self.last_change_at = self.count;
+    }
+
+    fn new() -> WaitingStat {
+        WaitingStat{ i: 0, count: 0, last_change_at: 0, last_waiting_time: 0, deltas: vec![0; 6] } // @hyper
+    }
+}
+
 async fn simulate(
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
         SimulationHyperParameters{ input_intensity, request_amount, mut users,
-            project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> Result<SimulationOutput> {
+            project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> MongoResult<SimulationOutput> {
+
     println!(":> Preparing simulation");
     let (spawner_tx, spawner_rx) = channel();
 
@@ -320,7 +344,8 @@ async fn simulate(
 
             if let Some(input_intensity) = input_intensity {
                 // Go to sleep
-                let sleep_duration_millis = -1000.0 * rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
+                let millis_in_second = 1000.0;
+                let sleep_duration_millis = -millis_in_second * rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
                 thread::sleep(time::Duration::from_millis(sleep_duration_millis as u64));
             }
 
@@ -338,49 +363,14 @@ async fn simulate(
     // Responsible for processing UserRequests
     println!(":> Starting simulation");
     let simulation_start = time::Instant::now();
-    let mut workers = vec![None; dbs.len()]; // all are available at the beginning
     let mut processed_user_requests = Vec::new();
-    type WorkerResult = (usize, time::Instant, time::Duration);
-    let (counter_tx, counter_rx) = channel::<WorkerResult>();
     let mut library = Library::new();
-    let mut requests_count_of_worker = vec![0u32; dbs.len()];
     crossbeam_utils::thread::scope(|scope| {
-        let mut collect_result = |workers: &mut Vec<Option<UserRequest>>, (finished_worker, finished_at, ping_lasted)| {
-            let worker: &mut Option<UserRequest> = &mut workers[finished_worker];
-            assert!(worker.is_some()); // must be not available yet. WTF with type???
-            let mut user_request = worker.take().unwrap();
-            user_request.finished_at = Some(finished_at);
-            user_request.ping_lasted = Some(ping_lasted);
-            processed_user_requests.push(user_request);
-        };
-
-        // ====================================================================
-        type Delta = i128;
-        struct WaitingStat {
-            i: usize,
-            count: usize,
-            last_change_at: usize,
-            last_waiting_time: Time,
-            deltas: Vec<Delta>,
-        };
-        impl WaitingStat {
-            fn put(&mut self, delta: Delta) {
-                self.deltas[self.i] = delta;
-                self.i = (self.i + 1) % self.deltas.len();
-                self.count += 1;
-            }
-
-            fn mark_change(&mut self) {
-                self.last_change_at = self.count;
-            }
-
-            fn new() -> WaitingStat {
-                WaitingStat{ i: 0, count: 0, last_change_at: 0, last_waiting_time: 0, deltas: vec![0; 6] } // @hyper
-            }
-        }
-
+        let mut workers: Vec<Option<UserRequest>> = vec![None; dbs.len()]; // all are available at the beginning
+        let mut requests_count_of_worker = vec![0u32; dbs.len()];
         let mut waiting_stat_for_user = HashMap::new();
-        // ====================================================================
+        type WorkerResult = (usize, time::Instant, time::Duration);
+        let (counter_tx, counter_rx) = channel::<WorkerResult>();
         let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
             // worktime = processed_count / processing_intensity
             requests_count.iter().enumerate()
@@ -395,10 +385,6 @@ async fn simulate(
                 .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2))
                 .map(|(i, _)| i)
         };
-        // ====================================================================
-        // The front has most priority as it has most waiting time
-        let mut queue = LinkedList::new();
-
         let process_received_user_request = |mut user_request: UserRequest, library: &mut Library,
                 requests_count: &Vec<u32>, dbs: &Vec<Database>, waiting_stat: &mut HashMap<_, _>| {
             user_request.received_at = Some(time::Instant::now());
@@ -424,14 +410,15 @@ async fn simulate(
             // ================================================================
             user_request
         };
-
+        // ====================================================================
+        let mut queue = LinkedList::new(); // the front has most priority as it has most waiting time
         let mut iteration = 0;
         let mut exit_condition = None; // exit on (iteration == Some(sent_requests_count).unwrap())
-        let mut processed_count = 0;
         let mut received_count = 0;
         'main: loop {
             if let Some(sent_count) = exit_condition {
-                if sent_count == processed_count {
+                if sent_count == processed_user_requests.len() {
+                    // we have processed everything that was sent to us
                     break 'main;
                 }
             } else {
@@ -460,10 +447,13 @@ async fn simulate(
             }
 
             // Collect finished workers, do not block
-            while let Ok(result) = counter_rx.try_recv() {
-                // TODO: inline function call
-                collect_result(&mut workers, result);
-                processed_count += 1;
+            while let Ok((finished_worker, finished_at, ping_lasted)) = counter_rx.try_recv() {
+                let worker = &mut workers[finished_worker];
+                assert!(worker.is_some()); // must be not available yet
+                let mut user_request = worker.take().unwrap();
+                user_request.finished_at = Some(finished_at);
+                user_request.ping_lasted = Some(ping_lasted);
+                processed_user_requests.push(user_request);
             }
 
 
@@ -481,9 +471,8 @@ async fn simulate(
             //     println!();
             // }
 
-            // NOTE: to make this a simple queue without look-through just .take(1)
             // For each UserRequest...
-            let task = queue.iter()
+            let task = queue.iter() // NOTE: to make this a simple queue without look-through just .take(1)
                 // ... get its able_worker_ids ...
                 .map(|r| &library.dbs_for_user[&r.user_id])
                 // ... try to find a fit Worker for it with most priority ...
@@ -491,14 +480,14 @@ async fn simulate(
                 .map(|able_worker_ids|
                     workers.iter().enumerate()
                         .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
-                        .next() // get first (most priority)
+                        .next() // get first (best performance)
                         .map(|(i, _)| i))
                 .enumerate()
                 // ... interested in UserRequests that currently have a fit Worker ...
                 .filter(|(_, worker_id_opt)| worker_id_opt.is_some())
                 // ... select first (longest in queue, most waiting time)
                 .next()
-                .map(|(i, w)| (i, w.unwrap())); // know it is Option::Some
+                .map(|(i, w)| (i, w.unwrap())); // checked that it is Option::Some earlier
             if let Some((user_request_i, chosen_worker)) = task {
                 let mut user_request = queue.remove(user_request_i);
                 print!("\rIteration [{}]", iteration);
@@ -510,28 +499,33 @@ async fn simulate(
                 user_request.processed_at_worker = Some(chosen_worker);
                 requests_count_of_worker[chosen_worker] += 1;
                 // ================================================================
+                // Update WaitingStat required for making decisions
                 let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
                 let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
                 let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
                 stat.last_waiting_time = waiting_time;
                 stat.put(delta);
 
+                // Mark Worker as busy
                 let user_id = user_request.user_id;
                 workers[chosen_worker] = Some(user_request);
+
+                // Make decision
                 let total_delta: Delta = stat.deltas.iter().sum();
-                let purify = stat.deltas.iter().all(|&d| d > 0);
-                if purify && total_delta as f32 > 0.0 && stat.count > stat.last_change_at + stat.deltas.len() / 2 {
-                    // println!("Because total delta {} > 0", total_delta);
+                let delta_rising = stat.deltas.iter().all(|&d| d > 0);
+                let last_change_long_enough_ago = stat.count > stat.last_change_at + stat.deltas.len() / 2;
+                if delta_rising && (total_delta > 0) && last_change_long_enough_ago {
                     let able_worker_ids = &library.dbs_for_user[&user_id];
                     if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
                         stat.mark_change();
+                        library.spread_user_to(user_id, new_db_id);
                         println!("Spreading user {} to {}", user_id, new_db_id);
-                        library.spread_user(user_id, new_db_id);
                     } else {
                         println!("Nowhere to spread {}", user_id);
                     }
                 }
                 // ================================================================
+                // Spawn processing thread
                 let inner_counter_tx = counter_tx.clone();
                 let client = &dbs[chosen_worker].client;
                 let _t = scope.spawn(move |_| {
@@ -540,7 +534,8 @@ async fn simulate(
 
                     let finish = time::Instant::now();
                     // Report that this worker has finished and is free now
-                    inner_counter_tx.send((chosen_worker, finish, ping_lasted)).expect("broken channel");
+                    let worker_result = (chosen_worker, finish, ping_lasted);
+                    inner_counter_tx.send(worker_result).expect("broken channel");
                 });
             }
         }
@@ -574,7 +569,7 @@ fn dump_user_data_to_str(UserData{ name, created_at, .. }: UserData) -> String {
     format!("[at: {}, of size: {}]", created_at, name)
 }
 
-async fn dump_to_str(client: &Client) -> Result<String> {
+async fn dump_to_str(client: &Client) -> MongoResult<String> {
     let mut result = String::new();
     let db = client.database("users");
     for collection_name in db.list_collection_names(None).await? {
@@ -598,7 +593,7 @@ async fn dump_to_str(client: &Client) -> Result<String> {
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn get_hyperparameters() -> Result<SimulationHyperParameters> {
+async fn get_hyperparameters() -> MongoResult<SimulationHyperParameters> {
     let mut dbs = vec![
         Database {
             client: Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
@@ -686,18 +681,21 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Processed UserRequests statistics:");
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
-    let mut worker_usage_count = Vec::new(); // TODO: emperically determines amount of workers
+    let mut worker_usage_count = Vec::new(); // TODO: empirically determines amount of Workers
+    let mut waiting_times_bad = Vec::with_capacity(processed_user_requests.len());
     for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, .. } in processed_user_requests {
-        let received_at = received_at.expect("empty time Option while describing processed request");
-        let assigned_at = assigned_at.expect("empty time Option while describing processed request");
-        let finished_at = finished_at.expect("empty time Option while describing processed request");
-        let processed_at_worker = processed_at_worker.expect("empty num Option while describing processed request");
-        let ping_lasted = ping_lasted.expect("empty ping Option while describing processed request");
+        let received_at =         received_at        .expect("empty Option while describing processed request");
+        let assigned_at =         assigned_at        .expect("empty Option while describing processed request");
+        let finished_at =         finished_at        .expect("empty Option while describing processed request");
+        let ping_lasted =         ping_lasted        .expect("empty Option while describing processed request");
+        let processed_at_worker = processed_at_worker.expect("empty Option while describing processed request");
 
         let waiting_time = assigned_at.duration_since(*created_at).as_millis();
-        let total_time = finished_at.duration_since(received_at).as_millis();
-        average_total_time += total_time;
+        let total_time   = finished_at.duration_since(received_at).as_millis();
+        average_total_time   += total_time;
         average_waiting_time += waiting_time;
+        waiting_times_bad.push(waiting_time);
+
         println!("Request [{:>4}] from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
             "#".repeat(*user_id as usize),
@@ -712,12 +710,20 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         }
         worker_usage_count[processed_at_worker] += 1;
     }
-    average_total_time   /= processed_user_requests.len() as u128;
-    average_waiting_time /= processed_user_requests.len() as u128;
+
+    let mut waiting_times = vec![0; processed_user_requests.len()];
+    for UserRequest{ created_at, assigned_at, id, .. } in processed_user_requests {
+        let assigned_at = assigned_at.expect("empty Option while describing processed request");
+        let waiting_time = assigned_at.duration_since(*created_at).as_millis();
+        waiting_times[*id as usize] = waiting_time;
+    }
+
     println!(":> Simulation finished in {} seconds", duration.as_secs());
     let processing_intensity = 1000.0 * processed_user_requests.len() as f32 / duration.as_millis() as f32;
     println!(":> Simulation processing intensity is {} requests per second ({} millis per request)",
         processing_intensity, (1000.0 / processing_intensity) as u32);
+    average_total_time   /= processed_user_requests.len() as u128;
+    average_waiting_time /= processed_user_requests.len() as u128;
     println!(":> Average total processing time = {} millis", average_total_time);
     println!(":> Average waiting time = {} millis", average_waiting_time);
     println!(":> Usage count of workers: {:?}", worker_usage_count);
@@ -736,13 +742,52 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         }).collect::<Vec<_>>();
     println!(":> Database usage by users: {:?}", users_for_db);
 
+    // Generate charts
+    draw_chart(waiting_times, "Waiting times", "time", "waiting time").expect("Unable to build chart");
+    draw_chart(waiting_times_bad, "Waiting times bad", "time", "waiting time").expect("Unable to build chart");
+
     println!();
+}
+
+fn draw_chart(arr: Vec<u128>, name: &str, x_axis_name: &str, y_axis_name: &str) -> Option<()> {
+    use plotters::prelude::*;
+    const WIDTH: u32 = 1900;
+    const HEIGHT: u32 = 300;
+    let max_x = arr.len() as u128;
+    let max_y = arr.iter().max().unwrap() + 100;
+
+    let dots = arr.into_iter().enumerate()
+        .map(|(i, elem)| (i as u128, elem))
+        .collect::<Vec<_>>();
+
+    let mut camel = name.to_string().replace(" ", "_");
+    camel.make_ascii_lowercase();
+    let img_path = format!("{}.png", camel);
+    let root = BitMapBackend::new(&img_path, (WIDTH, HEIGHT)).into_drawing_area();
+    root.fill(&WHITE).ok()?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(name, ("sans-serif", 20).into_font())
+        .margin(10)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..max_x, 0..max_y).ok()?;
+
+    chart.configure_mesh()
+        .x_desc(x_axis_name)
+        .y_desc(y_axis_name)
+        .draw().ok()?;
+
+    chart.draw_series(LineSeries::new(
+            dots.iter().map(|(x, y)| (*x, *y)), &RED)).ok()?;
+
+    Some(())
 }
 // ============================================================================
 // ============================================================================
 // ============================================================================
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> MongoResult<()> {
     let hyperparameters = get_hyperparameters().await?;
     let parameters = get_parameters();
 

@@ -16,6 +16,7 @@ rand_distr = "0.4.0"
 variant_count = "*"
 crossbeam = "0.8"
 crossbeam-utils = "0.8"
+plotters = "^0.3.0"
 
 [dependencies.serde]
 version = "1.0.111"
