@@ -185,6 +185,8 @@ struct UserRequest {
     finished_at: Option<time::Instant>,
     processed_at_worker: Option<usize>,
     ping_lasted: Option<time::Duration>,
+    triggered_spread: bool,
+    processed_at_iteration: usize,
     id: usize,
     // from: Location,
     // operation: Operation,
@@ -202,6 +204,8 @@ impl UserRequest {
             finished_at: None,
             processed_at_worker: None,
             ping_lasted: None,
+            triggered_spread: false,
+            processed_at_iteration: 0,
             id,
         }
     }
@@ -433,7 +437,7 @@ async fn simulate(
                         exit_condition = Some(received_count);
                     }
                 }
-                if queue.is_empty() {
+                if queue.is_empty() && exit_condition.is_none() {
                     // Must wait for at least one request to work with, so block
                     if let Some(user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
                         // println!("Forcefully waited for request {} from {} because queue is empty", user_request.id, user_request.user_id);
@@ -497,18 +501,16 @@ async fn simulate(
                 // println!("Choosing worker {}", chosen_worker);
                 user_request.assigned_at = Some(time::Instant::now());
                 user_request.processed_at_worker = Some(chosen_worker);
+                user_request.processed_at_iteration = iteration - 1;
                 requests_count_of_worker[chosen_worker] += 1;
                 // ================================================================
                 // Update WaitingStat required for making decisions
-                let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_request.user_id).expect("unregistered user");
+                let user_id = user_request.user_id;
+                let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_id).expect("unregistered user");
                 let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
                 let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
                 stat.last_waiting_time = waiting_time;
                 stat.put(delta);
-
-                // Mark Worker as busy
-                let user_id = user_request.user_id;
-                workers[chosen_worker] = Some(user_request);
 
                 // Make decision
                 let total_delta: Delta = stat.deltas.iter().sum();
@@ -519,11 +521,15 @@ async fn simulate(
                     if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
                         stat.mark_change();
                         library.spread_user_to(user_id, new_db_id);
+                        user_request.triggered_spread = true;
                         println!("Spreading user {} to {}", user_id, new_db_id);
                     } else {
                         println!("Nowhere to spread {}", user_id);
                     }
                 }
+
+                // Mark Worker as busy
+                workers[chosen_worker] = Some(user_request);
                 // ================================================================
                 // Spawn processing thread
                 let inner_counter_tx = counter_tx.clone();
@@ -682,7 +688,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
     let mut worker_usage_count = Vec::new(); // TODO: empirically determines amount of Workers
-    let mut waiting_times_bad = Vec::with_capacity(processed_user_requests.len());
+    // let mut waiting_times_bad = Vec::with_capacity(processed_user_requests.len());
     for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, .. } in processed_user_requests {
         let received_at =         received_at        .expect("empty Option while describing processed request");
         let assigned_at =         assigned_at        .expect("empty Option while describing processed request");
@@ -694,7 +700,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         let total_time   = finished_at.duration_since(received_at).as_millis();
         average_total_time   += total_time;
         average_waiting_time += waiting_time;
-        waiting_times_bad.push(waiting_time);
+        // waiting_times_bad.push(waiting_time);
 
         println!("Request [{:>4}] from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
@@ -711,11 +717,19 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
         worker_usage_count[processed_at_worker] += 1;
     }
 
-    let mut waiting_times = vec![0; processed_user_requests.len()];
-    for UserRequest{ created_at, assigned_at, id, .. } in processed_user_requests {
+    let mut waiting_times_by_id = vec![0; processed_user_requests.len()];
+    let mut waiting_times_by_iteration = vec![0; processed_user_requests.len()];
+    let mut spread_moments_by_id = Vec::new();
+    let mut spread_moments_by_iteration = Vec::new();
+    for UserRequest{ created_at, assigned_at, id, processed_at_iteration, triggered_spread, .. } in processed_user_requests {
         let assigned_at = assigned_at.expect("empty Option while describing processed request");
         let waiting_time = assigned_at.duration_since(*created_at).as_millis();
-        waiting_times[*id as usize] = waiting_time;
+        waiting_times_by_id[*id as usize] = waiting_time;
+        waiting_times_by_iteration[*processed_at_iteration] = waiting_time;
+        if *triggered_spread {
+            spread_moments_by_id.push(*id as u128);
+            spread_moments_by_iteration.push(*processed_at_iteration as u128);
+        }
     }
 
     println!(":> Simulation finished in {} seconds", duration.as_secs());
@@ -743,13 +757,14 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Database usage by users: {:?}", users_for_db);
 
     // Generate charts
-    draw_chart(waiting_times, "Waiting times", "time", "waiting time").expect("Unable to build chart");
-    draw_chart(waiting_times_bad, "Waiting times bad", "time", "waiting time").expect("Unable to build chart");
+    draw_chart(waiting_times_by_id, Some(&spread_moments_by_id), "Waiting times by id", "request id", "waiting time").expect("Unable to build chart");
+    draw_chart(waiting_times_by_iteration, Some(&spread_moments_by_iteration), "Waiting times by iteration", "iteration", "waiting time").expect("Unable to build chart");
+    // draw_chart(waiting_times_bad, None, "Waiting times bad", "time", "waiting time").expect("Unable to build chart");
 
     println!();
 }
 
-fn draw_chart(arr: Vec<u128>, name: &str, x_axis_name: &str, y_axis_name: &str) -> Option<()> {
+fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_name: &str, y_axis_name: &str) -> Option<()> {
     use plotters::prelude::*;
     const WIDTH: u32 = 1900;
     const HEIGHT: u32 = 300;
@@ -779,7 +794,13 @@ fn draw_chart(arr: Vec<u128>, name: &str, x_axis_name: &str, y_axis_name: &str) 
         .draw().ok()?;
 
     chart.draw_series(LineSeries::new(
-            dots.iter().map(|(x, y)| (*x, *y)), &RED)).ok()?;
+            dots.iter().map(|(x, y)| (*x, *y)), &BLUE)).ok()?;
+
+    if let Some(moments) = marked {
+        for moment in moments.iter() {
+            chart.draw_series(LineSeries::new(vec![(*moment, 0), (*moment, max_y)], &RED)).ok()?;
+        }
+    }
 
     Some(())
 }
