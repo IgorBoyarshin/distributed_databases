@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::LinkedList;
 
-use rand::Rng;
+use rand::{Rng};
+// use rand::SeedableRng;
 // use rand_distr::{Poisson, Distribution};
 // use rand_distr::num_traits::Pow;
 use rand::distributions::Open01;
@@ -42,6 +43,7 @@ use futures::executor::block_on;
 use std::thread;
 use std::time;
 use std::sync::mpsc::channel;
+use tokio::time as tokio_time;
 // ============================================================================
 // ============================================================================
 // ============================================================================
@@ -213,6 +215,18 @@ impl UserRequest {
 // ============================================================================
 // ============================================================================
 // ============================================================================
+async fn do_db(Database{ client, ping_millis, .. }: &Database) -> MongoResult<time::Duration> {
+    let start = time::Instant::now();
+    {
+        if let Some(client) = client {
+            ping(&client).await?;
+        } else {
+            tokio_time::sleep(tokio_time::Duration::from_millis(*ping_millis as u64)).await;
+        }
+    }
+    Ok(start.elapsed())
+}
+
 async fn ping(client: &Client) -> MongoResult<time::Duration> {
     let start = time::Instant::now();
     {
@@ -513,10 +527,9 @@ async fn simulate(
                 stat.put(delta);
 
                 // Make decision
-                let total_delta: Delta = stat.deltas.iter().sum();
                 let delta_rising = stat.deltas.iter().all(|&d| d > 0);
                 let last_change_long_enough_ago = stat.count > stat.last_change_at + stat.deltas.len() / 2;
-                if delta_rising && (total_delta > 0) && last_change_long_enough_ago {
+                if delta_rising && last_change_long_enough_ago {
                     let able_worker_ids = &library.dbs_for_user[&user_id];
                     if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
                         stat.mark_change();
@@ -533,10 +546,10 @@ async fn simulate(
                 // ================================================================
                 // Spawn processing thread
                 let inner_counter_tx = counter_tx.clone();
-                let client = &dbs[chosen_worker].client;
+                let db = &dbs[chosen_worker];
                 let _t = scope.spawn(move |_| {
                     // Process here
-                    let ping_lasted = block_on(ping(&client)).expect("failed ping");
+                    let ping_lasted = block_on(do_db(&db)).expect("failed ping");
 
                     let finish = time::Instant::now();
                     // Report that this worker has finished and is free now
@@ -558,7 +571,7 @@ async fn simulate(
 // ============================================================================
 // ============================================================================
 struct Database {
-    client: Client,
+    client: Option<Client>,
     name: &'static str,
     ping_millis: Time,
 }
@@ -599,29 +612,62 @@ async fn dump_to_str(client: &Client) -> MongoResult<String> {
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn get_hyperparameters() -> MongoResult<SimulationHyperParameters> {
-    let mut dbs = vec![
-        Database {
-            client: Client::with_uri_str(env::var("MONGO_CHRISTMAS").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
-            name: "Christmas Tree",
-            ping_millis: 0,
-        },
-        Database {
-            client: Client::with_uri_str(env::var("MONGO_ORANGE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
-            name: "Orange Tree",
-            ping_millis: 0,
-        },
-        Database {
-            client: Client::with_uri_str(env::var("MONGO_LEMON").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
-            name: "Lemon Tree",
-            ping_millis: 0,
-        },
-        Database {
-            client: Client::with_uri_str(env::var("MONGO_MAPLE").expect("Set the MONGO_<NAME> env!").as_ref()).await?,
-            name: "Maple Tree",
-            ping_millis: 0,
-        },
-    ];
+async fn get_client(env_name: &str) -> MongoResult<Client> {
+    Client::with_uri_str(env::var(env_name).expect("Set the MONGO_<NAME> env!").as_ref()).await
+}
+
+async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParameters> {
+    let mut dbs: Vec<Database> = if is_real {
+        println!(":> Determining ping to DBs...");
+        // Parallel ping seems to give skewed results. As this procedure is not that
+        // long and is done only once, we don't mind waiting a bit for sequential ping.
+
+        vec![
+            ("MONGO_CHRISTMAS", "Christmas Tree"),
+            ("MONGO_ORANGE", "Orange Tree"),
+            ("MONGO_LEMON", "Lemon Tree"),
+            ("MONGO_MAPLE", "Maple Tree")
+        ].into_iter()
+        .map(|(env,    name)| (block_on(get_client(env)).expect("failed to get client"), name))
+        .map(|(client, name)| Database {
+            ping_millis: block_on(determine_ping(&client)).expect("ping failed").as_millis(),
+            client: Some(client),
+            name: name
+        })
+        .collect()
+    } else {
+        vec![
+            (262, "Christmas Tree"),
+            (71, "Orange Tree"),
+            (131, "Lemon Tree"),
+            (41, "Maple Tree")
+        ].into_iter()
+        .map(|(ping, name)| Database { client: None, name: name, ping_millis: ping })
+        .collect()
+    };
+
+    // let mut dbs = vec![
+    //     Database {
+    //         client: if is_real { Some(get_client("MONGO_CHRISTMAS").await?) } else { None },
+    //         name: "Christmas Tree",
+    //         ping_millis: 0,
+    //     },
+    //     Database {
+    //         client: if is_real { Some(get_client("MONGO_ORANGE").await?) } else { None },
+    //         name: "Orange Tree",
+    //         ping_millis: 0,
+    //     },
+    //     Database {
+    //         client: if is_real { Some(get_client("MONGO_LEMON").await?) } else { None },
+    //         name: "Lemon Tree",
+    //         ping_millis: 0,
+    //     },
+    //     Database {
+    //         client: if is_real { Some(get_client("MONGO_MAPLE").await?) } else { None },
+    //         name: "Maple Tree",
+    //         ping_millis: 0,
+    //     },
+    // ];
     let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
 
     let projects_per_user = 4;
@@ -632,12 +678,14 @@ async fn get_hyperparameters() -> MongoResult<SimulationHyperParameters> {
     let users = User::create_users(5, projects_count, projects_per_user);
 
 
-    println!(":> Determining ping to DBs...");
-    // Parallel ping seems to give skewed results. As this procedure is not that
-    // long and is done only once, we don't mind waiting a bit for sequential ping.
-    for db in dbs.iter_mut() {
-        db.ping_millis = determine_ping(&db.client).await?.as_millis();
-    }
+    // if is_real {
+    //     println!(":> Determining ping to DBs...");
+    //     // Parallel ping seems to give skewed results. As this procedure is not that
+    //     // long and is done only once, we don't mind waiting a bit for sequential ping.
+    //     for db in dbs.iter_mut() {
+    //         db.ping_millis = determine_ping(&db.client).await?.as_millis();
+    //     }
+    // }
 
     println!(":> Sorting DBs based on ping");
     dbs.sort_by(|Database{ ping_millis: p1, ..}, Database{ ping_millis: p2, ..}| p1.cmp(p2));
@@ -654,7 +702,7 @@ async fn get_hyperparameters() -> MongoResult<SimulationHyperParameters> {
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 2 * 512,
+        request_amount: 1 * 512,
         // input_intensity: None,
         input_intensity: Some(0.9 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -672,9 +720,9 @@ fn get_parameters() -> SimulationParameters {
     }
 }
 
-fn describe_simulation_hyperparameters(SimulationHyperParameters{ users: _, .. }: &SimulationHyperParameters) {
-    // println!(":> Users:");
-    // for user in users.iter() { describe_user(&user); }
+fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &SimulationHyperParameters) {
+    println!(":> Users:");
+    for user in users.iter() { describe_user(&user); }
     println!();
 }
 
@@ -687,8 +735,7 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     println!(":> Processed UserRequests statistics:");
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
-    let mut worker_usage_count = Vec::new(); // TODO: empirically determines amount of Workers
-    // let mut waiting_times_bad = Vec::with_capacity(processed_user_requests.len());
+    let mut worker_usage_count = Vec::new(); // empirically determines the amount of Workers
     for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, .. } in processed_user_requests {
         let received_at =         received_at        .expect("empty Option while describing processed request");
         let assigned_at =         assigned_at        .expect("empty Option while describing processed request");
@@ -719,16 +766,35 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
 
     let mut waiting_times_by_id = vec![0; processed_user_requests.len()];
     let mut waiting_times_by_iteration = vec![0; processed_user_requests.len()];
+    let mut per_user_waiting_times_id = Vec::new();
+    let mut per_user_waiting_times_iteration = Vec::new();
     let mut spread_moments_by_id = Vec::new();
     let mut spread_moments_by_iteration = Vec::new();
-    for UserRequest{ created_at, assigned_at, id, processed_at_iteration, triggered_spread, .. } in processed_user_requests {
+    let mut per_user_spread_id = Vec::new();
+    let mut per_user_spread_iteration = Vec::new();
+    for UserRequest{ user_id, created_at, assigned_at, id, processed_at_iteration, triggered_spread, .. } in processed_user_requests {
         let assigned_at = assigned_at.expect("empty Option while describing processed request");
         let waiting_time = assigned_at.duration_since(*created_at).as_millis();
         waiting_times_by_id[*id as usize] = waiting_time;
         waiting_times_by_iteration[*processed_at_iteration] = waiting_time;
+
+        while *user_id as usize >= per_user_waiting_times_id.len() {
+            per_user_waiting_times_id.push(vec![0; processed_user_requests.len()]);
+            per_user_spread_id.push(Vec::new());
+        }
+        per_user_waiting_times_id[*user_id as usize][*id as usize] = waiting_time;
+
+        while *user_id as usize >= per_user_waiting_times_iteration.len() {
+            per_user_waiting_times_iteration.push(vec![0; processed_user_requests.len()]);
+            per_user_spread_iteration.push(Vec::new());
+        }
+        per_user_waiting_times_iteration[*user_id as usize][*processed_at_iteration] = waiting_time;
+
         if *triggered_spread {
             spread_moments_by_id.push(*id as u128);
             spread_moments_by_iteration.push(*processed_at_iteration as u128);
+            per_user_spread_iteration[*user_id as usize].push(*processed_at_iteration as u128);
+            per_user_spread_id[*user_id as usize].push(*id as u128);
         }
     }
 
@@ -759,7 +825,12 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     // Generate charts
     draw_chart(waiting_times_by_id, Some(&spread_moments_by_id), "Waiting times by id", "request id", "waiting time").expect("Unable to build chart");
     draw_chart(waiting_times_by_iteration, Some(&spread_moments_by_iteration), "Waiting times by iteration", "iteration", "waiting time").expect("Unable to build chart");
-    // draw_chart(waiting_times_bad, None, "Waiting times bad", "time", "waiting time").expect("Unable to build chart");
+    // for (i, times_for_user) in per_user_waiting_times_id.into_iter().enumerate() {
+    //     draw_chart(times_for_user, Some(&per_user_spread_id[i]), &format!("Waiting times by id for user {}", i), "request id", "waiting time").expect("Unable to build chart");
+    // }
+    // for (i, times_for_user) in per_user_waiting_times_iteration.into_iter().enumerate() {
+    //     draw_chart(times_for_user, Some(&per_user_spread_iteration[i]), &format!("Waiting times by iteration for user {}", i), "iteration", "waiting time").expect("Unable to build chart");
+    // }
 
     println!();
 }
@@ -809,7 +880,7 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 // ============================================================================
 #[tokio::main]
 async fn main() -> MongoResult<()> {
-    let hyperparameters = get_hyperparameters().await?;
+    let hyperparameters = get_hyperparameters(true).await?;
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
