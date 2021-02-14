@@ -38,7 +38,6 @@ use variant_count::VariantCount;
 // use std::io::Write;
 // use plotters::prelude::{RED, WHITE, ChartBuilder, LineSeries, BitMapBackend};
 
-// use crossbeam_utils;
 use futures::executor::block_on;
 use std::thread;
 use std::time;
@@ -549,7 +548,13 @@ async fn simulate(
                 let db = &dbs[chosen_worker];
                 let _t = scope.spawn(move |_| {
                     // Process here
-                    let ping_lasted = block_on(do_db(&db)).expect("failed ping");
+                    let ping_lasted = if let Some(client) = &db.client {
+                        block_on(ping(&client)).expect("failed ping")
+                    } else {
+                        let duration = time::Duration::from_millis(db.ping_millis as u64);
+                        crossbeam::channel::after(duration).recv().unwrap();
+                        duration
+                    };
 
                     let finish = time::Instant::now();
                     // Report that this worker has finished and is free now
@@ -880,7 +885,7 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 // ============================================================================
 #[tokio::main]
 async fn main() -> MongoResult<()> {
-    let hyperparameters = get_hyperparameters(true).await?;
+    let hyperparameters = get_hyperparameters(false).await?;
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
