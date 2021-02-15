@@ -42,7 +42,7 @@ use futures::executor::block_on;
 use std::thread;
 use std::time;
 use std::sync::mpsc::channel;
-use tokio::time as tokio_time;
+// use tokio::time as tokio_time;
 // ============================================================================
 // ============================================================================
 // ============================================================================
@@ -214,18 +214,6 @@ impl UserRequest {
 // ============================================================================
 // ============================================================================
 // ============================================================================
-async fn do_db(Database{ client, ping_millis, .. }: &Database) -> MongoResult<time::Duration> {
-    let start = time::Instant::now();
-    {
-        if let Some(client) = client {
-            ping(&client).await?;
-        } else {
-            tokio_time::sleep(tokio_time::Duration::from_millis(*ping_millis as u64)).await;
-        }
-    }
-    Ok(start.elapsed())
-}
-
 async fn ping(client: &Client) -> MongoResult<time::Duration> {
     let start = time::Instant::now();
     {
@@ -361,9 +349,18 @@ async fn simulate(
 
             if let Some(input_intensity) = input_intensity {
                 // Go to sleep
-                let millis_in_second = 1000.0;
-                let sleep_duration_millis = -millis_in_second * rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
-                thread::sleep(time::Duration::from_millis(sleep_duration_millis as u64));
+                // let sleep_duration_millis = -millis_in_second * rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
+                let sleep_duration = -rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
+                // let millis_in_second = 1_000.0;
+                // let sleep_millis = (millis_in_second * sleep_duration) as u64;
+                // let duration = time::Duration::from_millis(sleep_millis);
+                // println!("Sleeping for {} millis", sleep_millis as u64);
+                let micros_in_second = 1_000_000.0;
+                let sleep_micros = (micros_in_second * sleep_duration) as u64;
+                let duration = time::Duration::from_micros(sleep_micros);
+                // println!("Sleeping for {} micros", sleep_micros as u64);
+
+                thread::sleep(duration);
             }
 
             time += 1;
@@ -507,7 +504,8 @@ async fn simulate(
                 .map(|(i, w)| (i, w.unwrap())); // checked that it is Option::Some earlier
             if let Some((user_request_i, chosen_worker)) = task {
                 let mut user_request = queue.remove(user_request_i);
-                print!("\rIteration [{}]", iteration);
+                println!("Iteration [{}] with queue of {}", iteration, queue.len());
+                // print!("\rIteration [{}]", iteration);
                 iteration += 1;
 
                 // ================================================================
@@ -623,6 +621,7 @@ async fn get_client(env_name: &str) -> MongoResult<Client> {
 
 async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParameters> {
     let mut dbs: Vec<Database> = if is_real {
+        println!(":> Performing simulation with real MondoDBs");
         println!(":> Determining ping to DBs...");
         // Parallel ping seems to give skewed results. As this procedure is not that
         // long and is done only once, we don't mind waiting a bit for sequential ping.
@@ -641,38 +640,21 @@ async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParame
         })
         .collect()
     } else {
+        println!(":> Performing fake simulation");
         vec![
-            (262, "Christmas Tree"),
-            (71, "Orange Tree"),
-            (131, "Lemon Tree"),
-            (41, "Maple Tree")
+            // (4, "Christmas Tree"), // 262
+            // (2, "Orange Tree"), // 71
+            // (3, "Lemon Tree"), // 131
+            // (2*1, "Maple Tree") // 41
+            (26, "Christmas Tree"), // 262
+            (7, "Orange Tree"), // 71
+            (13, "Lemon Tree"), // 131
+            (4, "Maple Tree") // 41
         ].into_iter()
         .map(|(ping, name)| Database { client: None, name: name, ping_millis: ping })
         .collect()
     };
 
-    // let mut dbs = vec![
-    //     Database {
-    //         client: if is_real { Some(get_client("MONGO_CHRISTMAS").await?) } else { None },
-    //         name: "Christmas Tree",
-    //         ping_millis: 0,
-    //     },
-    //     Database {
-    //         client: if is_real { Some(get_client("MONGO_ORANGE").await?) } else { None },
-    //         name: "Orange Tree",
-    //         ping_millis: 0,
-    //     },
-    //     Database {
-    //         client: if is_real { Some(get_client("MONGO_LEMON").await?) } else { None },
-    //         name: "Lemon Tree",
-    //         ping_millis: 0,
-    //     },
-    //     Database {
-    //         client: if is_real { Some(get_client("MONGO_MAPLE").await?) } else { None },
-    //         name: "Maple Tree",
-    //         ping_millis: 0,
-    //     },
-    // ];
     let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
 
     let projects_per_user = 4;
@@ -682,15 +664,6 @@ async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParame
     // we would like all simulation to be conducted with the same set of users.
     let users = User::create_users(5, projects_count, projects_per_user);
 
-
-    // if is_real {
-    //     println!(":> Determining ping to DBs...");
-    //     // Parallel ping seems to give skewed results. As this procedure is not that
-    //     // long and is done only once, we don't mind waiting a bit for sequential ping.
-    //     for db in dbs.iter_mut() {
-    //         db.ping_millis = determine_ping(&db.client).await?.as_millis();
-    //     }
-    // }
 
     println!(":> Sorting DBs based on ping");
     dbs.sort_by(|Database{ ping_millis: p1, ..}, Database{ ping_millis: p2, ..}| p1.cmp(p2));
@@ -707,7 +680,7 @@ async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParame
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 1 * 512,
+        request_amount: 2 * 512,
         // input_intensity: None,
         input_intensity: Some(0.9 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
