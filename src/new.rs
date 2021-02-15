@@ -25,11 +25,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::LinkedList;
 
-use rand::{Rng};
-// use rand::SeedableRng;
-// use rand_distr::{Poisson, Distribution};
-// use rand_distr::num_traits::Pow;
 use rand::distributions::Open01;
+use rand_chacha::ChaCha8Rng as ChaChaRng;
+use rand::{ Rng, SeedableRng };
+
+// use std::sync::{Arc, Mutex};
+// type Random = Arc<Mutex<dyn RngCore>>;
 
 
 use variant_count::VariantCount;
@@ -37,6 +38,7 @@ use variant_count::VariantCount;
 // use std::fs::File;
 // use std::io::Write;
 // use plotters::prelude::{RED, WHITE, ChartBuilder, LineSeries, BitMapBackend};
+
 
 use futures::executor::block_on;
 use std::thread;
@@ -64,14 +66,14 @@ enum UserBehavior {
 }
 
 impl UserBehavior {
-    fn gen(&mut self, projects_amount: usize) -> ProjectId {
+    fn gen(&mut self, random: &mut ChaChaRng, projects_amount: usize) -> ProjectId {
         match self {
             UserBehavior::AveragedSequential{ amount, left, project_id } => {
                 let max_amount = 10;
 
                 if *left == 0 {
-                    *amount     = rand::thread_rng().gen_range(1..=max_amount);
-                    *project_id = rand::thread_rng().gen_range(0..projects_amount);
+                    *amount     = random.gen_range(1..=max_amount);
+                    *project_id = random.gen_range(0..projects_amount);
                     *left       = *amount;
                 }
                 *left -= 1;
@@ -79,41 +81,41 @@ impl UserBehavior {
                 *project_id
             },
             UserBehavior::AveragedRandom => {
-                rand::thread_rng().gen_range(0..projects_amount)
+                random.gen_range(0..projects_amount)
             },
             UserBehavior::PreferentialMono{ project_id } =>{
                 let preferential_probability = 0.7;
-                let use_preferred = rand::thread_rng().sample::<f32, _>(Open01) > preferential_probability;
+                let use_preferred = random.sample::<f32, _>(Open01) > preferential_probability;
                 if use_preferred {
                     *project_id
                 } else {
-                    rand::thread_rng().gen_range(0..projects_amount)
+                    random.gen_range(0..projects_amount)
                 }
             },
             UserBehavior::PreferentialDuo{ project_id_1, project_id_2 } =>{
                 let preferential_probability = 0.7 / 2.0;
-                let use_preferred_chance = rand::thread_rng().sample::<f32, _>(Open01);
+                let use_preferred_chance = random.sample::<f32, _>(Open01);
                 if use_preferred_chance <= preferential_probability {
                     *project_id_1
                 } else if use_preferred_chance <= 2.0 * preferential_probability {
                     *project_id_2
                 } else {
-                    rand::thread_rng().gen_range(0..projects_amount)
+                    random.gen_range(0..projects_amount)
                 }
             },
         }
     }
 
-    fn random(projects_amount: usize) -> UserBehavior {
-        match rand::thread_rng().gen_range(0..UserBehavior::VARIANT_COUNT) {
+    fn random(random: &mut ChaChaRng, projects_amount: usize) -> UserBehavior {
+        match random.gen_range(0..UserBehavior::VARIANT_COUNT) {
             0 => UserBehavior::AveragedSequential{ amount: /* any */ 0, left: 0, project_id: /* any */ 0 },
             1 => UserBehavior::AveragedRandom,
-            2 => UserBehavior::PreferentialMono{ project_id: rand::thread_rng().gen_range(0..projects_amount) },
+            2 => UserBehavior::PreferentialMono{ project_id: random.gen_range(0..projects_amount) },
             3 => {
                 assert!(projects_amount > 1);
-                let project_id_1 = rand::thread_rng().gen_range(0..projects_amount);
+                let project_id_1 = random.gen_range(0..projects_amount);
                 let project_id_2 = loop {
-                    let project_id = rand::thread_rng().gen_range(0..projects_amount);
+                    let project_id = random.gen_range(0..projects_amount);
                     if project_id != project_id_1 {
                         break project_id;
                     }
@@ -134,28 +136,28 @@ struct User {
 }
 
 impl User {
-    fn gen(&mut self) -> ProjectId {
-        self.user_behavior.gen(self.project_ids.len())
+    fn gen(&mut self, random: &mut ChaChaRng) -> ProjectId {
+        self.user_behavior.gen(random, self.project_ids.len())
     }
 
-    fn create_users(users_amount: usize, projects_amount: usize, projects_per_user: usize) -> Vec<User> {
+    fn create_users(random: &mut ChaChaRng, users_amount: usize, projects_amount: usize, projects_per_user: usize) -> Vec<User> {
         let mut vec = Vec::with_capacity(users_amount);
         for id in 0..users_amount {
-            let user_behavior = UserBehavior::random(projects_amount);
-            let project_ids = generate_count_random_indices_until(projects_per_user, projects_amount);
+            let user_behavior = UserBehavior::random(random, projects_amount);
+            let project_ids = generate_count_random_indices_until(random, projects_per_user, projects_amount);
             vec.push(User{ user_behavior, id: id as UserId, project_ids });
         }
         vec
     }
 }
 
-fn generate_count_random_indices_until(count: usize, len: usize) -> Vec<ProjectId> {
+fn generate_count_random_indices_until(random: &mut ChaChaRng, count: usize, len: usize) -> Vec<ProjectId> {
     let mut vec = Vec::with_capacity(count as usize);
     let mut left = count;
     for index in 0..len {
         let remaining_indices = len - index;
         let take_probability = (left as f32) / (remaining_indices as f32);
-        let take = rand::thread_rng().sample::<f32, _>(Open01) < take_probability;
+        let take = random.sample::<f32, _>(Open01) < take_probability;
         if take {
             vec.push(index);
             left -= 1;
@@ -324,6 +326,7 @@ impl WaitingStat {
 }
 
 async fn simulate(
+        mut random: ChaChaRng,
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
         SimulationHyperParameters{ input_intensity, request_amount, mut users,
             project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> MongoResult<SimulationOutput> {
@@ -338,10 +341,10 @@ async fn simulate(
         loop {
             // Pick random user
             let len = users.len();
-            let user = &mut users[rand::thread_rng().gen_range(0..len)];
+            let user = &mut users[random.gen_range(0..len)];
 
             // Pick project for this User according to his Strategy
-            let project_id = user.gen();
+            let project_id = user.gen(&mut random);
 
             // Send for execution
             let request = UserRequest::new(user.id, project_id, time::Instant::now(), time);
@@ -350,7 +353,7 @@ async fn simulate(
             if let Some(input_intensity) = input_intensity {
                 // Go to sleep
                 // let sleep_duration_millis = -millis_in_second * rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
-                let sleep_duration = -rand::thread_rng().sample::<f32, _>(Open01).ln() / input_intensity;
+                let sleep_duration = -random.sample::<f32, _>(Open01).ln() / input_intensity;
                 // let millis_in_second = 1_000.0;
                 // let sleep_millis = (millis_in_second * sleep_duration) as u64;
                 // let duration = time::Duration::from_millis(sleep_millis);
@@ -619,7 +622,7 @@ async fn get_client(env_name: &str) -> MongoResult<Client> {
     Client::with_uri_str(env::var(env_name).expect("Set the MONGO_<NAME> env!").as_ref()).await
 }
 
-async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParameters> {
+async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResult<SimulationHyperParameters> {
     let mut dbs: Vec<Database> = if is_real {
         println!(":> Performing simulation with real MondoDBs");
         println!(":> Determining ping to DBs...");
@@ -642,14 +645,14 @@ async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParame
     } else {
         println!(":> Performing fake simulation");
         vec![
-            // (4, "Christmas Tree"), // 262
-            // (2, "Orange Tree"), // 71
-            // (3, "Lemon Tree"), // 131
-            // (2*1, "Maple Tree") // 41
-            (26, "Christmas Tree"), // 262
-            (7, "Orange Tree"), // 71
-            (13, "Lemon Tree"), // 131
-            (4, "Maple Tree") // 41
+            // (262, "Christmas Tree"), // 262
+            // (71, "Orange Tree"), // 71
+            // (131, "Lemon Tree"), // 131
+            // (41, "Maple Tree") // 41
+            (52, "Christmas Tree"), // 262
+            (14, "Orange Tree"), // 71
+            (26, "Lemon Tree"), // 131
+            (8, "Maple Tree") // 41
         ].into_iter()
         .map(|(ping, name)| Database { client: None, name: name, ping_millis: ping })
         .collect()
@@ -662,7 +665,7 @@ async fn get_hyperparameters(is_real: bool) -> MongoResult<SimulationHyperParame
     // Users are created here and not inside simulation based on hyperparameters
     // because there is an element of random in creation (e.g. Behavior), and
     // we would like all simulation to be conducted with the same set of users.
-    let users = User::create_users(5, projects_count, projects_per_user);
+    let users = User::create_users(random, 5, projects_count, projects_per_user);
 
 
     println!(":> Sorting DBs based on ping");
@@ -858,12 +861,14 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 // ============================================================================
 #[tokio::main]
 async fn main() -> MongoResult<()> {
-    let hyperparameters = get_hyperparameters(false).await?;
+    let mut random = ChaChaRng::seed_from_u64(314);
+
+    let hyperparameters = get_hyperparameters(&mut random, false).await?;
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
 
-    let output = simulate(parameters, hyperparameters).await?;
+    let output = simulate(random, parameters, hyperparameters).await?;
 
     describe_simulation_output(&output);
 
