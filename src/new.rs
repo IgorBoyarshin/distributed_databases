@@ -432,6 +432,38 @@ async fn simulate(
         let mut iteration = 0;
         let mut exit_condition = None; // exit on (iteration == Some(sent_requests_count).unwrap())
         let mut received_count = 0;
+
+        let mut threads = Vec::with_capacity(dbs.len());
+        let mut threads_tx = Vec::with_capacity(dbs.len());
+        for _ in 0..dbs.len() {
+            println!(":> Spawning Worker thread...");
+            let (tx, rx) = channel::<Option<(std::sync::mpsc::Sender<WorkerResult>, &Database, usize)>>();
+
+            let t = scope.spawn(move |_| {
+                while let Some((counter_tx, db, chosen_worker)) = rx.recv().expect("broken thread pipe rx") {
+                    // Process here
+                    let ping_lasted = if let Some(client) = &db.client {
+                        block_on(ping(&client)).expect("failed ping")
+                    } else {
+                        let duration = time::Duration::from_millis(db.ping_millis as u64);
+                        crossbeam::channel::after(duration).recv().unwrap();
+                        duration
+                    };
+
+                    let finish = time::Instant::now();
+                    // Report that this worker has finished and is free now
+                    let worker_result = (chosen_worker, finish, ping_lasted);
+                    counter_tx.send(worker_result).expect("broken channel");
+                }
+
+                // Received None => time to die...
+                println!(":> Terminating Worker thread...");
+            });
+
+            threads.push(t);
+            threads_tx.push(tx);
+        }
+
         'main: loop {
             if let Some(sent_count) = exit_condition {
                 if sent_count == processed_user_requests.len() {
@@ -544,25 +576,19 @@ async fn simulate(
                 // Mark Worker as busy
                 workers[chosen_worker] = Some(user_request);
                 // ================================================================
-                // Spawn processing thread
+                // Launch processing thread
                 let inner_counter_tx = counter_tx.clone();
                 let db = &dbs[chosen_worker];
-                let _t = scope.spawn(move |_| {
-                    // Process here
-                    let ping_lasted = if let Some(client) = &db.client {
-                        block_on(ping(&client)).expect("failed ping")
-                    } else {
-                        let duration = time::Duration::from_millis(db.ping_millis as u64);
-                        crossbeam::channel::after(duration).recv().unwrap();
-                        duration
-                    };
-
-                    let finish = time::Instant::now();
-                    // Report that this worker has finished and is free now
-                    let worker_result = (chosen_worker, finish, ping_lasted);
-                    inner_counter_tx.send(worker_result).expect("broken channel");
-                });
+                threads_tx[chosen_worker].send(Some((inner_counter_tx, db, chosen_worker))).expect("broken thread pipe tx");
             }
+        }
+
+        // Finish all threads
+        for tx in threads_tx.into_iter() {
+            tx.send(None).expect("broken thread pipe tx");
+        }
+        for thread in threads.into_iter() {
+            thread.join().expect("unable to join Worker");
         }
     }).expect("crossbeam scope unwrap failure");
 
