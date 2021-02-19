@@ -295,6 +295,7 @@ struct SimulationParameters {
 }
 
 struct SimulationOutput {
+    start: time::Instant,
     duration: time::Duration,
     processed_user_requests: Vec<UserRequest>,
     dbs_for_user: HashMap<UserId, Vec<usize>>,
@@ -595,7 +596,7 @@ async fn simulate(
     let simulation_duration = simulation_start.elapsed();
     println!();
 
-    Ok(SimulationOutput{ duration: simulation_duration, processed_user_requests,
+    Ok(SimulationOutput{ start: simulation_start, duration: simulation_duration, processed_user_requests,
         dbs_for_user: library.dbs_for_user,
         average_db_ping_millis: dbs.iter().map(|db| db.ping_millis).collect::<Vec<_>>() })
 }
@@ -733,7 +734,7 @@ fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &
     println!();
 }
 
-fn describe_simulation_output(SimulationOutput{ duration, processed_user_requests, dbs_for_user, average_db_ping_millis }: &SimulationOutput) {
+fn describe_simulation_output(SimulationOutput{ start, duration, processed_user_requests, dbs_for_user, average_db_ping_millis }: &SimulationOutput) {
     /*
      * The (assigned_at - received_at) time generally can never be greater than
      * the waiting time for the fastest worker, so this metric is useless as a
@@ -838,6 +839,10 @@ fn describe_simulation_output(SimulationOutput{ duration, processed_user_request
     // for (i, times_for_user) in per_user_waiting_times_iteration.into_iter().enumerate() {
     //     draw_chart(times_for_user, Some(&per_user_spread_iteration[i]), &format!("Waiting times by iteration for user {}", i), "iteration", "waiting time").expect("Unable to build chart");
     // }
+
+    for UserRequest{ created_at, received_at, id, .. } in processed_user_requests {
+        println!("[{}] Created = {}, Received = {}", id, created_at.duration_since(*start).as_micros(), received_at.unwrap().duration_since(*start).as_micros());
+    }
 
     println!();
 }
