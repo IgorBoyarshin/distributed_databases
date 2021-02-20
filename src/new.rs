@@ -53,52 +53,52 @@ enum UserBehavior {
     AveragedSequential {
         amount: u32,
         left: u32,
-        project_id: ProjectId,
+        project_index: usize,
     },
     AveragedRandom,
     PreferentialMono {
-        project_id: ProjectId,
+        project_index: usize,
     },
     PreferentialDuo {
-        project_id_1: ProjectId,
-        project_id_2: ProjectId,
+        project_index_1: usize,
+        project_index_2: usize,
     },
 }
 
 impl UserBehavior {
-    fn gen(&mut self, random: &mut ChaChaRng, projects_amount: usize) -> ProjectId {
+    fn gen_index(&mut self, random: &mut ChaChaRng, projects_amount: usize) -> usize {
         match self {
-            UserBehavior::AveragedSequential{ amount, left, project_id } => {
+            UserBehavior::AveragedSequential{ amount, left, project_index } => {
                 let max_amount = 10;
 
                 if *left == 0 {
                     *amount     = random.gen_range(1..=max_amount);
-                    *project_id = random.gen_range(0..projects_amount);
+                    *project_index = random.gen_range(0..projects_amount);
                     *left       = *amount;
                 }
                 *left -= 1;
 
-                *project_id
+                *project_index
             },
             UserBehavior::AveragedRandom => {
                 random.gen_range(0..projects_amount)
             },
-            UserBehavior::PreferentialMono{ project_id } =>{
-                let preferential_probability = 0.7;
-                let use_preferred = random.sample::<f32, _>(Open01) > preferential_probability;
+            UserBehavior::PreferentialMono{ project_index } =>{
+                let preferential_probability = 0.5;
+                let use_preferred = random.sample::<f32, _>(Open01) < preferential_probability;
                 if use_preferred {
-                    *project_id
+                    *project_index
                 } else {
                     random.gen_range(0..projects_amount)
                 }
             },
-            UserBehavior::PreferentialDuo{ project_id_1, project_id_2 } =>{
-                let preferential_probability = 0.7 / 2.0;
+            UserBehavior::PreferentialDuo{ project_index_1, project_index_2 } =>{
+                let preferential_probability = 0.5 / 2.0;
                 let use_preferred_chance = random.sample::<f32, _>(Open01);
                 if use_preferred_chance <= preferential_probability {
-                    *project_id_1
+                    *project_index_1
                 } else if use_preferred_chance <= 2.0 * preferential_probability {
-                    *project_id_2
+                    *project_index_2
                 } else {
                     random.gen_range(0..projects_amount)
                 }
@@ -108,19 +108,19 @@ impl UserBehavior {
 
     fn random(random: &mut ChaChaRng, projects_amount: usize) -> UserBehavior {
         match random.gen_range(0..UserBehavior::VARIANT_COUNT) {
-            0 => UserBehavior::AveragedSequential{ amount: /* any */ 0, left: 0, project_id: /* any */ 0 },
+            0 => UserBehavior::AveragedSequential{ amount: /* any */ 0, left: 0, project_index: /* any */ 0 },
             1 => UserBehavior::AveragedRandom,
-            2 => UserBehavior::PreferentialMono{ project_id: random.gen_range(0..projects_amount) },
+            2 => UserBehavior::PreferentialMono{ project_index: random.gen_range(0..projects_amount) },
             3 => {
                 assert!(projects_amount > 1);
-                let project_id_1 = random.gen_range(0..projects_amount);
-                let project_id_2 = loop {
-                    let project_id = random.gen_range(0..projects_amount);
-                    if project_id != project_id_1 {
-                        break project_id;
+                let project_index_1 = random.gen_range(0..projects_amount);
+                let project_index_2 = loop {
+                    let project_index = random.gen_range(0..projects_amount);
+                    if project_index != project_index_1 {
+                        break project_index;
                     }
                 };
-                UserBehavior::PreferentialDuo{ project_id_1, project_id_2 }
+                UserBehavior::PreferentialDuo{ project_index_1, project_index_2 }
             },
             _ => panic!("Bad range for UserBehavior random"),
         }
@@ -137,13 +137,13 @@ struct User {
 
 impl User {
     fn gen(&mut self, random: &mut ChaChaRng) -> ProjectId {
-        self.user_behavior.gen(random, self.project_ids.len())
+        self.project_ids[self.user_behavior.gen_index(random, self.project_ids.len())]
     }
 
     fn create_users(random: &mut ChaChaRng, users_amount: usize, projects_amount: usize, projects_per_user: usize) -> Vec<User> {
         let mut vec = Vec::with_capacity(users_amount);
         for id in 0..users_amount {
-            let user_behavior = UserBehavior::random(random, projects_amount);
+            let user_behavior = UserBehavior::random(random, projects_per_user);
             let project_ids = generate_count_random_indices_until(random, projects_per_user, projects_amount);
             vec.push(User{ user_behavior, id: id as UserId, project_ids });
         }
@@ -174,7 +174,7 @@ fn describe_user(User{ user_behavior, id, project_ids }: &User) {
 // ============================================================================
 // ============================================================================
 type ProjectId = usize;
-type UserId = u32;
+type UserId = usize;
 type Time = u128;
 
 type IterationType = u128;
@@ -310,26 +310,28 @@ async fn determine_ping(client: &Client) -> MongoResult<time::Duration> {
 // ============================================================================
 struct Library {
     dbs_for_user: HashMap<UserId, Vec<usize>>,
+    dbs_for_project: HashMap<ProjectId, Vec<usize>>,
 }
 
 impl Library {
     fn new() -> Library {
         Library {
             dbs_for_user: HashMap::new(),
+            dbs_for_project: HashMap::new(),
         }
     }
 
-    fn user_registered(&self, user_id: UserId) -> bool {
-        self.dbs_for_user.contains_key(&user_id)
+    fn project_registered(&self, project_id: ProjectId) -> bool {
+        self.dbs_for_project.contains_key(&project_id)
     }
 
-    fn register_new_user(&mut self, user_id: UserId, db_id: usize) {
-        self.dbs_for_user.insert(user_id, vec![db_id]);
+    fn register_new_project(&mut self, project_id: ProjectId, db_id: usize) {
+        self.dbs_for_project.insert(project_id, vec![db_id]);
     }
 
-    fn spread_user_to(&mut self, user_id: UserId, db_id: usize) {
-        assert!(!self.dbs_for_user[&user_id].contains(&db_id));
-        self.dbs_for_user.get_mut(&user_id).expect("invalid ID").push(db_id);
+    fn spread_project_to(&mut self, project_id: ProjectId, db_id: usize) {
+        assert!(!self.dbs_for_project[&project_id].contains(&db_id));
+        self.dbs_for_project.get_mut(&project_id).expect("invalid ID").push(db_id);
     }
 }
 
@@ -352,7 +354,7 @@ struct SimulationOutput {
     start: MyTime,
     duration: MyDuration,
     processed_user_requests: Vec<UserRequest>,
-    dbs_for_user: HashMap<UserId, Vec<usize>>,
+    dbs_for_project: HashMap<ProjectId, Vec<usize>>,
     average_db_ping_millis: Vec<Time>,
 }
 
@@ -401,7 +403,7 @@ fn simulate_fake(
 
     let mut workers: Vec<Option<UserRequest>> = vec![None; dbs.len()]; // all are available at the beginning
     let mut requests_count_of_worker = vec![0u32; dbs.len()];
-    let mut waiting_stat_for_user = HashMap::new();
+    let mut waiting_stat_for_project = HashMap::new();
     // type WorkerResult = (usize, MyTime, MyTime);
     // let mut counter_queue = LinkedList<WorkerResult>::new(); // TODO type needed??
     let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
@@ -441,12 +443,12 @@ fn simulate_fake(
                 let mut request = UserRequest::new(user.id, project_id, MyTime::Iteration(iteration), user_request_id_to_spawn);
                 request.received_at = Some(MyTime::Iteration(iteration));
                 user_request_id_to_spawn += 1;
-                // A new User?
-                if !library.user_registered(request.user_id) {
+                // A new Project?
+                if !library.project_registered(request.project_id) {
                     let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
-                    library.register_new_user(request.user_id, db_id);
-                    waiting_stat_for_user.insert(request.user_id, WaitingStat::new());
-                    println!("Registering user {} to {}", request.user_id, db_id);
+                    library.register_new_project(request.project_id, db_id);
+                    waiting_stat_for_project.insert(request.project_id, WaitingStat::new());
+                    println!("Registering project {} to {}", request.project_id, db_id);
                 }
                 queue.push_back(request);
 
@@ -459,7 +461,8 @@ fn simulate_fake(
 
                 if let Some(input_intensity) = input_intensity {
                     // Go to sleep
-                    let sleep_duration = -random.sample::<f32, _>(Open01).ln() / input_intensity;
+                    // let sleep_duration = -random.sample::<f32, _>(Open01).ln() / input_intensity;
+                    let sleep_duration = 1.0 / input_intensity;
                     let nanos_in_second = 1_000_000_000.0;
                     let sleep_nanos = (nanos_in_second * sleep_duration) as u64;
                     println!("Sleeping for {} nanos", sleep_nanos as u64);
@@ -471,11 +474,8 @@ fn simulate_fake(
         }
 
         // ======================== Free workers ==============================
-        // let mut workers_to_free = Vec::new();
-        let mut freed = false;
         for (worker_id, wake_at) in pending_workers.iter_mut().enumerate() {
             if *wake_at == iteration { // time to wake this worker
-                freed = true;
                 *wake_at = IterationType::MAX;
 
                 let worker = &mut workers[worker_id];
@@ -485,16 +485,13 @@ fn simulate_fake(
                 processed_user_requests.push(user_request);
             }
         }
-        if freed {
-            // println!(":> .... to free some!");
-        }
 
 
         // ======================== Put for execution =========================
         // For each UserRequest...
         let task = queue.iter() // NOTE: to make this a simple queue without look-through just .take(1)
             // ... get its able_worker_ids ...
-            .map(|r| &library.dbs_for_user[&r.user_id])
+            .map(|r| &library.dbs_for_project[&r.project_id])
             // ... try to find a fit Worker for it with most priority ...
             // (a Worker is fit if free && current UserRequest can be processed on it)
             .map(|able_worker_ids|
@@ -522,8 +519,8 @@ fn simulate_fake(
             requests_count_of_worker[chosen_worker] += 1;
             // ================================================================
             // Update WaitingStat required for making decisions
-            let user_id = user_request.user_id;
-            let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_id).expect("unregistered user");
+            let project_id = user_request.project_id;
+            let stat: &mut WaitingStat = waiting_stat_for_project.get_mut(&project_id).expect("unregistered project");
             let waiting_time = user_request.assigned_at.unwrap().duration_since(&user_request.created_at).as_millis();
             let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
             stat.last_waiting_time = waiting_time;
@@ -533,18 +530,18 @@ fn simulate_fake(
             let delta_rising = stat.deltas.iter().all(|&d| d > 0);
             let last_change_long_enough_ago = stat.count > stat.last_change_at + stat.deltas.len() / 2;
             if delta_rising && last_change_long_enough_ago {
-                let able_worker_ids = &library.dbs_for_user[&user_id];
+                let able_worker_ids = &library.dbs_for_project[&project_id];
                 if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
                     stat.mark_change();
-                    library.spread_user_to(user_id, new_db_id);
+                    library.spread_project_to(project_id, new_db_id);
                     user_request.triggered_spread = true;
-                    println!("Spreading user {} to {}", user_id, new_db_id);
+                    println!("Spreading project {} to {}", project_id, new_db_id);
                     // println!("... because deltas are {:?}", stat.deltas);
                 } else {
-                    println!("Nowhere to spread {}", user_id);
+                    println!("Nowhere to spread {}", project_id);
                 }
             }
-            println!("... because deltas are {:?}", stat.deltas);
+            // println!("... because deltas are {:?}", stat.deltas);
 
             // ================================================================
             // Launch processing thread
@@ -573,7 +570,7 @@ fn simulate_fake(
     println!();
 
     SimulationOutput{ start: simulation_start, duration: simulation_duration, processed_user_requests,
-        dbs_for_user: library.dbs_for_user,
+        dbs_for_project: library.dbs_for_project,
         average_db_ping_millis: dbs.iter().map(|db| db.ping_millis).collect::<Vec<_>>() }
 }
 
@@ -637,7 +634,7 @@ async fn simulate(
     crossbeam_utils::thread::scope(|scope| {
         let mut workers: Vec<Option<UserRequest>> = vec![None; dbs.len()]; // all are available at the beginning
         let mut requests_count_of_worker = vec![0u32; dbs.len()];
-        let mut waiting_stat_for_user = HashMap::new();
+        let mut waiting_stat_for_project = HashMap::new();
         type WorkerResult = (usize, MyTime, MyDuration);
         let (counter_tx, counter_rx) = channel::<WorkerResult>();
         let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
@@ -669,12 +666,12 @@ async fn simulate(
                 user_request.created_at = MyTime::Instant(time::Instant::now());
             }
             // ================================================================
-            // A new User?
-            if !library.user_registered(user_request.user_id) {
+            // A new Project?
+            if !library.project_registered(user_request.project_id) {
                 let db_id = worker_with_least_worktime(&requests_count, &dbs);
-                library.register_new_user(user_request.user_id, db_id);
-                waiting_stat.insert(user_request.user_id, WaitingStat::new());
-                println!("Registering user {} to {}", user_request.user_id, db_id);
+                library.register_new_project(user_request.project_id, db_id);
+                waiting_stat.insert(user_request.project_id, WaitingStat::new());
+                println!("Registering project {} to {}", user_request.project_id, db_id);
             }
             // ================================================================
             user_request
@@ -703,7 +700,7 @@ async fn simulate(
                     });
 
                     let finish = MyTime::Instant(time::Instant::now());
-                    // Report that this worker has finished and is free now
+                    // Report that this Worker has finished and is free now
                     let worker_result = (chosen_worker, finish, ping_lasted);
                     counter_tx.send(worker_result).expect("broken channel");
                 }
@@ -719,16 +716,15 @@ async fn simulate(
         'main: loop {
             if let Some(sent_count) = exit_condition {
                 if sent_count == processed_user_requests.len() {
-                    // we have processed everything that was sent to us
+                    // We have processed everything that was sent to us
                     break 'main;
                 }
             } else {
                 // Collect all pending UserRequests, do not block
                 while let Ok(user_request) = spawner_rx.try_recv() {
                     if let Some(user_request) = user_request {
-                        // println!("Saw pending request {} from {}", user_request.id, user_request.user_id);
                         queue.push_back(process_received_user_request(user_request, &mut library,
-                                &requests_count_of_worker, &dbs, &mut waiting_stat_for_user));
+                                &requests_count_of_worker, &dbs, &mut waiting_stat_for_project));
                         received_count += 1;
                     } else {
                         exit_condition = Some(received_count);
@@ -737,9 +733,8 @@ async fn simulate(
                 if queue.is_empty() && exit_condition.is_none() {
                     // Must wait for at least one request to work with, so block
                     if let Some(user_request) = spawner_rx.recv().expect("dead spawner_tx channel") {
-                        // println!("Forcefully waited for request {} from {} because queue is empty", user_request.id, user_request.user_id);
                         queue.push_back(process_received_user_request(user_request, &mut library,
-                                &requests_count_of_worker, &dbs, &mut waiting_stat_for_user));
+                                &requests_count_of_worker, &dbs, &mut waiting_stat_for_project));
                         received_count += 1;
                     } else {
                         exit_condition = Some(received_count);
@@ -760,7 +755,7 @@ async fn simulate(
             // For each UserRequest...
             let task = queue.iter() // NOTE: to make this a simple queue without look-through just .take(1)
                 // ... get its able_worker_ids ...
-                .map(|r| &library.dbs_for_user[&r.user_id])
+                .map(|r| &library.dbs_for_project[&r.project_id])
                 // ... try to find a fit Worker for it with most priority ...
                 // (a Worker is fit if free && current UserRequest can be processed on it)
                 .map(|able_worker_ids|
@@ -788,8 +783,8 @@ async fn simulate(
                 requests_count_of_worker[chosen_worker] += 1;
                 // ================================================================
                 // Update WaitingStat required for making decisions
-                let user_id = user_request.user_id;
-                let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_id).expect("unregistered user");
+                let project_id = user_request.project_id;
+                let stat: &mut WaitingStat = waiting_stat_for_project.get_mut(&project_id).expect("Unregistered project");
                 let waiting_time = user_request.assigned_at.unwrap().duration_since(&user_request.created_at).as_millis();
                 let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
                 stat.last_waiting_time = waiting_time;
@@ -799,14 +794,14 @@ async fn simulate(
                 let delta_rising = stat.deltas.iter().all(|&d| d > 0);
                 let last_change_long_enough_ago = stat.count > stat.last_change_at + stat.deltas.len() / 2;
                 if delta_rising && last_change_long_enough_ago {
-                    let able_worker_ids = &library.dbs_for_user[&user_id];
+                    let able_worker_ids = &library.dbs_for_project[&project_id];
                     if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
                         stat.mark_change();
-                        library.spread_user_to(user_id, new_db_id);
+                        library.spread_project_to(project_id, new_db_id);
                         user_request.triggered_spread = true;
-                        println!("Spreading user {} to {}", user_id, new_db_id);
+                        println!("Spreading project {} to {}", project_id, new_db_id);
                     } else {
-                        println!("Nowhere to spread {}", user_id);
+                        println!("Nowhere to spread {}", project_id);
                     }
                 }
 
@@ -833,7 +828,7 @@ async fn simulate(
     println!();
 
     Ok(SimulationOutput{ start: MyTime::Instant(simulation_start), duration: MyDuration::Timed(simulation_duration), processed_user_requests,
-        dbs_for_user: library.dbs_for_user,
+        dbs_for_project: library.dbs_for_project,
         average_db_ping_millis: dbs.iter().map(|db| db.ping_millis).collect::<Vec<_>>() })
 }
 // ============================================================================
@@ -896,7 +891,7 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
             ("MONGO_CHRISTMAS", "Christmas Tree"),
             ("MONGO_ORANGE", "Orange Tree"),
             ("MONGO_LEMON", "Lemon Tree"),
-            ("MONGO_MAPLE", "Maple Tree")
+            ("MONGO_MAPLE", "Maple Tree"),
         ].into_iter()
         .map(|(env,    name)| (block_on(get_client(env)).expect("failed to get client"), name))
         .map(|(client, name)| Database {
@@ -915,7 +910,13 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
             (1_000 * 262, "Christmas Tree"), // 262
             (1_000 * 71, "Orange Tree"), // 71
             (1_000 * 131, "Lemon Tree"), // 131
-            (1_000 * 41, "Maple Tree") // 41
+            (1_000 * 41, "Maple Tree"), // 41
+
+            (1_000 * 31, "Maple Tree 2"), // 41
+            (1_000 * 21, "Maple Tree 3"), // 41
+            (1_000 * 45, "Maple Tree 4"), // 41
+            (1_000 * 91, "Maple Tree 5"), // 41
+            (1_000 * 141, "Maple Tree 6"), // 41
             // (1_000 * 61, "Christmas Tree"), // 262
             // (1_000 * 13, "Orange Tree"), // 71
             // (1_000 * 23, "Lemon Tree"), // 131
@@ -951,9 +952,9 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 16 * 512,
+        request_amount: 8 * 512,
         // input_intensity: None,
-        input_intensity: Some(0.9 * max_processing_intensity),
+        input_intensity: Some(0.85 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
         dbs,
         project_names,
@@ -975,7 +976,7 @@ fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &
     println!();
 }
 
-fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_user_requests, dbs_for_user, average_db_ping_millis }: &SimulationOutput) {
+fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_user_requests, dbs_for_project, average_db_ping_millis }: &SimulationOutput) {
     /*
      * The (assigned_at - received_at) time generally can never be greater than
      * the waiting time for the fastest worker, so this metric is useless as a
@@ -985,7 +986,7 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
     let mut worker_usage_count = Vec::new(); // empirically determines the amount of Workers
-    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, .. } in processed_user_requests {
+    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, project_id, .. } in processed_user_requests {
         let received_at =         received_at        .expect("empty Option while describing processed request");
         let assigned_at =         assigned_at        .expect("empty Option while describing processed request");
         let finished_at =         finished_at        .expect("empty Option while describing processed request");
@@ -998,8 +999,9 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
         average_waiting_time += waiting_time;
         // waiting_times_bad.push(waiting_time);
 
-        println!("Request [{:>4}] from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        println!("Request [{:>4}] with project {:>2} from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
             id,
+            project_id,
             "#".repeat(*user_id as usize),
             waiting_time,
             total_time,
@@ -1059,17 +1061,17 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
     let db_len = average_db_ping_millis.len();
     println!(":> Database worktime: {:?}",
         average_db_ping_millis.into_iter().zip(worker_usage_count.into_iter()).map(|(ping, count)| ping * count as Time).collect::<Vec<_>>());
-    let users_for_db = (0..db_len).into_iter()
+    let projects_for_db = (0..db_len).into_iter()
         .map(|i| {
             let mut res = Vec::new();
-            for (user, dbs) in dbs_for_user.iter() {
+            for (project, dbs) in dbs_for_project.iter() {
                 if dbs.contains(&i) {
-                    res.push(user);
+                    res.push(project);
                 }
             }
             res
         }).collect::<Vec<_>>();
-    println!(":> Database usage by users: {:?}", users_for_db);
+    println!(":> Database usage by projects: {:?}", projects_for_db);
 
     // Generate charts
     draw_chart(waiting_times_by_id, Some(&spread_moments_by_id), "Waiting times by id", "request id", "waiting time").expect("Unable to build chart");
@@ -1135,7 +1137,7 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 async fn main() -> MongoResult<()> {
     let simulation_is_real = false;
 
-    let mut random = ChaChaRng::seed_from_u64(315);
+    let mut random = ChaChaRng::seed_from_u64(317);
 
     let hyperparameters = get_hyperparameters(&mut random, simulation_is_real).await?;
     let parameters = get_parameters();
