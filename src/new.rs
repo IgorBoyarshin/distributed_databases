@@ -337,7 +337,8 @@ struct SimulationHyperParameters {
     request_amount: usize,
     input_intensity: Option<f32>,
     dbs: Vec<Database>,
-    project_names: Vec<&'static str>,
+    project_names: Vec<String>,
+    // project_names: Vec<&'static str>,
     users: Vec<User>,
     synchronize_db_changes: bool,
 }
@@ -924,9 +925,10 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
         .collect()
     };
 
-    let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
+    // let project_names = vec!["Quartz", "Pyrite", "Lapis Lazuli", "Amethyst", "Jasper", "Malachite", "Diamond"];
+    let project_names = (0..20).map(|i| format!("Project_{}", i)).collect::<Vec<_>>();
 
-    let projects_per_user = 4;
+    let projects_per_user = 7;
     let projects_count = project_names.len();
     // Users are created here and not inside simulation based on hyperparameters
     // because there is an element of random in creation (e.g. Behavior), and
