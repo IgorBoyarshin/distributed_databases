@@ -177,17 +177,70 @@ type ProjectId = usize;
 type UserId = u32;
 type Time = u128;
 
+type IterationType = u128;
+
+#[derive(Debug, Copy, Clone)]
+enum MyTime {
+    Instant(time::Instant),
+    Iteration(IterationType),
+}
+#[derive(Debug, Copy, Clone)]
+enum MyDuration {
+    Timed(time::Duration),
+    Iterated(IterationType),
+}
+
+impl MyTime {
+    fn duration_since(&self, other: &MyTime) -> MyDuration {
+        match self {
+            MyTime::Instant(time) => {
+                if let MyTime::Instant(other_time) = other {
+                    MyDuration::Timed(time.duration_since(*other_time))
+                } else { panic!("Different MyTimes used"); }
+            },
+            MyTime::Iteration(iteration) => {
+                if let MyTime::Iteration(other_iteration) = other {
+                    MyDuration::Iterated(iteration - other_iteration)
+                } else { panic!("Different MyTimes used"); }
+            },
+        }
+    }
+}
+
+impl MyDuration {
+    fn as_secs(&self) -> u128 {
+        match self {
+            MyDuration::Timed(duration) => duration.as_secs() as u128,
+            MyDuration::Iterated(micros) => micros / 1_000_000,
+        }
+    }
+
+    fn as_millis(&self) -> u128 {
+        match self {
+            MyDuration::Timed(duration) => duration.as_millis(),
+            MyDuration::Iterated(micros) => micros / 1_000,
+        }
+    }
+
+    fn as_micros(&self) -> u128 {
+        match self {
+            MyDuration::Timed(duration) => duration.as_micros(),
+            MyDuration::Iterated(micros) => *micros,
+        }
+    }
+}
+
 // #[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 #[derive(Debug, Copy, Clone)]
 struct UserRequest {
     user_id: UserId,
     project_id: ProjectId,
-    created_at: time::Instant,
-    received_at: Option<time::Instant>,
-    assigned_at: Option<time::Instant>,
-    finished_at: Option<time::Instant>,
+    created_at: MyTime,
+    received_at: Option<MyTime>,
+    assigned_at: Option<MyTime>,
+    finished_at: Option<MyTime>,
     processed_at_worker: Option<usize>,
-    ping_lasted: Option<time::Duration>,
+    ping_lasted: Option<MyDuration>,
     triggered_spread: bool,
     processed_at_iteration: usize,
     id: usize,
@@ -199,7 +252,7 @@ struct UserRequest {
 // struct ProcessedUserRequest {}
 
 impl UserRequest {
-    fn new(user_id: UserId, project_id: ProjectId, created_at: time::Instant, id: usize) -> UserRequest {
+    fn new(user_id: UserId, project_id: ProjectId, created_at: MyTime, id: usize) -> UserRequest {
         UserRequest {
             user_id, project_id, created_at,
             received_at: None,
@@ -295,8 +348,8 @@ struct SimulationParameters {
 }
 
 struct SimulationOutput {
-    start: time::Instant,
-    duration: time::Duration,
+    start: MyTime,
+    duration: MyDuration,
     processed_user_requests: Vec<UserRequest>,
     dbs_for_user: HashMap<UserId, Vec<usize>>,
     average_db_ping_millis: Vec<Time>,
@@ -326,6 +379,201 @@ impl WaitingStat {
     }
 }
 
+// NOTE
+// NOTE registration occurs on creation, data may be outdated
+// NOTE
+fn simulate_fake(
+        mut random: ChaChaRng,
+        SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
+        SimulationHyperParameters{ input_intensity, request_amount, mut users,
+            project_names: _, dbs, synchronize_db_changes: _ }: SimulationHyperParameters) -> SimulationOutput {
+
+    let mut iteration: IterationType = 0;
+    let mut user_request_id_to_spawn = 0;
+    // let mut spawner_queue = LinkedList::new(); // front has the oldest
+    let mut queue = LinkedList::new(); // the front has most priority as it has most waiting time
+    let mut spawning_done = false;
+
+    let simulation_start = MyTime::Iteration(iteration);
+    let mut processed_user_requests = Vec::new();
+    let mut library = Library::new();
+
+    let mut workers: Vec<Option<UserRequest>> = vec![None; dbs.len()]; // all are available at the beginning
+    let mut requests_count_of_worker = vec![0u32; dbs.len()];
+    let mut waiting_stat_for_user = HashMap::new();
+    // type WorkerResult = (usize, MyTime, MyTime);
+    // let mut counter_queue = LinkedList<WorkerResult>::new(); // TODO type needed??
+    let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
+        // worktime = processed_count / processing_intensity
+        requests_count.iter().enumerate()
+            .map(|(i, &count)| (i, count as Time * dbs[i].ping_millis))
+            .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2)).expect("empty iterator")
+            .0
+    };
+    let unclaimed_worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>, able_worker_ids: &Vec<usize>| {
+        requests_count.iter().enumerate()
+            .filter(|(i, _)| !able_worker_ids.contains(i)) // only interested in yet unclaimed Workers
+            .map(|(i, &count)| (i, count as Time * dbs[i].ping_millis))
+            .min_by(|(_, wt1), (_, wt2)| wt1.cmp(wt2))
+            .map(|(i, _)| i)
+    };
+    // ====================================================================
+    let mut processing_number = 0;
+
+    let mut pending_workers = vec![IterationType::MAX; dbs.len()];
+    let mut spawn_wake_at = 0;
+
+    'simulation_loop: loop {
+        println!(":> Woke at iteration {} with processed len = {}", iteration, processed_user_requests.len());
+        // Spawn UserRequests
+        if iteration == spawn_wake_at && !spawning_done {
+            println!(":> .... to spawn some!");
+            'spawning_loop: loop { // loop is used to make instant multi-spawning possible
+                // Pick random user
+                let len = users.len();
+                let user = &mut users[random.gen_range(0..len)];
+
+                // Pick project for this User according to his Strategy
+                let project_id = user.gen(&mut random);
+
+                // Send for execution
+                let mut request = UserRequest::new(user.id, project_id, MyTime::Iteration(iteration), user_request_id_to_spawn);
+                request.received_at = Some(MyTime::Iteration(iteration));
+                user_request_id_to_spawn += 1;
+                // A new User?
+                if !library.user_registered(request.user_id) {
+                    let db_id = worker_with_least_worktime(&requests_count_of_worker, &dbs);
+                    library.register_new_user(request.user_id, db_id);
+                    waiting_stat_for_user.insert(request.user_id, WaitingStat::new());
+                    println!("Registering user {} to {}", request.user_id, db_id);
+                }
+                queue.push_back(request);
+
+                // Finish simulation?
+                if user_request_id_to_spawn == request_amount {
+                    spawning_done = true;
+                    spawn_wake_at = IterationType::MAX;
+                    break 'spawning_loop;
+                }
+
+                if let Some(input_intensity) = input_intensity {
+                    // Go to sleep
+                    let sleep_duration = -random.sample::<f32, _>(Open01).ln() / input_intensity;
+                    let micros_in_second = 1_000_000.0;
+                    let sleep_micros = (micros_in_second * sleep_duration) as u64;
+                    // println!("Sleeping for {} micros", sleep_micros as u64);
+
+                    spawn_wake_at = iteration + sleep_micros as u128;
+                    break 'spawning_loop;
+                }
+            }
+        }
+
+        // ======================== Free workers ==============================
+        // let mut workers_to_free = Vec::new();
+        let mut freed = false;
+        for (worker_id, wake_at) in pending_workers.iter_mut().enumerate() {
+            if *wake_at == iteration { // time to wake this worker
+                freed = true;
+                *wake_at = IterationType::MAX;
+
+                let worker = &mut workers[worker_id];
+                assert!(worker.is_some()); // must be not available yet
+                let mut user_request = worker.take().unwrap();
+                user_request.finished_at = Some(MyTime::Iteration(iteration));
+                processed_user_requests.push(user_request);
+            }
+        }
+        if freed {
+            println!(":> .... to free some!");
+        }
+
+
+        // ======================== Put for execution =========================
+        // For each UserRequest...
+        let task = queue.iter() // NOTE: to make this a simple queue without look-through just .take(1)
+            // ... get its able_worker_ids ...
+            .map(|r| &library.dbs_for_user[&r.user_id])
+            // ... try to find a fit Worker for it with most priority ...
+            // (a Worker is fit if free && current UserRequest can be processed on it)
+            .map(|able_worker_ids|
+                workers.iter().enumerate()
+                    .filter(|(i, req)| req.is_none() && able_worker_ids.contains(i))
+                    .next() // get first (best performance)
+                    .map(|(i, _)| i))
+            .enumerate()
+            // ... interested in UserRequests that currently have a fit Worker ...
+            .filter(|(_, worker_id_opt)| worker_id_opt.is_some())
+            // ... select first (longest in queue, most waiting time)
+            .next()
+            .map(|(i, w)| (i, w.unwrap())); // checked that it is Option::Some earlier
+        if let Some((user_request_i, chosen_worker)) = task {
+            println!(":> .... to assign some!");
+            let mut user_request = queue.remove(user_request_i);
+            println!("Processing number [{}] with queue of {}", processing_number, queue.len());
+            processing_number += 1;
+
+            // ================================================================
+            // println!("Choosing worker {}", chosen_worker);
+            user_request.assigned_at = Some(MyTime::Iteration(iteration));
+            user_request.processed_at_worker = Some(chosen_worker);
+            user_request.processed_at_iteration = processing_number - 1;
+            requests_count_of_worker[chosen_worker] += 1;
+            // ================================================================
+            // Update WaitingStat required for making decisions
+            let user_id = user_request.user_id;
+            let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_id).expect("unregistered user");
+            let waiting_time = user_request.assigned_at.unwrap().duration_since(&user_request.created_at).as_millis();
+            let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
+            stat.last_waiting_time = waiting_time;
+            stat.put(delta);
+
+            // Make decision
+            let delta_rising = stat.deltas.iter().all(|&d| d > 0);
+            let last_change_long_enough_ago = stat.count > stat.last_change_at + stat.deltas.len() / 2;
+            if delta_rising && last_change_long_enough_ago {
+                let able_worker_ids = &library.dbs_for_user[&user_id];
+                if let Some(new_db_id) = unclaimed_worker_with_least_worktime(&requests_count_of_worker, &dbs, &able_worker_ids) {
+                    stat.mark_change();
+                    library.spread_user_to(user_id, new_db_id);
+                    user_request.triggered_spread = true;
+                    println!("Spreading user {} to {}", user_id, new_db_id);
+                } else {
+                    println!("Nowhere to spread {}", user_id);
+                }
+            }
+
+            // ================================================================
+            // Launch processing thread
+            let db = &dbs[chosen_worker];
+            let sleep_micros = db.ping_millis * 1000;
+            user_request.ping_lasted = Some(MyDuration::Iterated(sleep_micros));
+            // Mark Worker as busy
+            workers[chosen_worker] = Some(user_request);
+            pending_workers[chosen_worker] = iteration + sleep_micros;
+        }
+
+        // ======================== Finish simulation? ========================
+        if spawning_done && processed_user_requests.len() == request_amount {
+            break 'simulation_loop;
+        }
+
+        // ======================== Decide when to wake up ====================
+        let mut min = IterationType::MAX;
+        for &wake_at in pending_workers.iter() {
+            if wake_at < min { min = wake_at; }
+        }
+        if spawn_wake_at < min { min = spawn_wake_at; }
+        iteration = min;
+    }
+    let simulation_duration = MyTime::Iteration(iteration).duration_since(&simulation_start);
+    println!();
+
+    SimulationOutput{ start: simulation_start, duration: simulation_duration, processed_user_requests,
+        dbs_for_user: library.dbs_for_user,
+        average_db_ping_millis: dbs.iter().map(|db| db.ping_millis).collect::<Vec<_>>() }
+}
+
 async fn simulate(
         mut random: ChaChaRng,
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
@@ -348,7 +596,7 @@ async fn simulate(
             let project_id = user.gen(&mut random);
 
             // Send for execution
-            let request = UserRequest::new(user.id, project_id, time::Instant::now(), time);
+            let request = UserRequest::new(user.id, project_id, MyTime::Instant(time::Instant::now()), time);
             spawner_tx.send(Some(request)).unwrap();
 
             if let Some(input_intensity) = input_intensity {
@@ -387,7 +635,7 @@ async fn simulate(
         let mut workers: Vec<Option<UserRequest>> = vec![None; dbs.len()]; // all are available at the beginning
         let mut requests_count_of_worker = vec![0u32; dbs.len()];
         let mut waiting_stat_for_user = HashMap::new();
-        type WorkerResult = (usize, time::Instant, time::Duration);
+        type WorkerResult = (usize, MyTime, MyDuration);
         let (counter_tx, counter_rx) = channel::<WorkerResult>();
         let worker_with_least_worktime = |requests_count: &Vec<u32>, dbs: &Vec<Database>| {
             // worktime = processed_count / processing_intensity
@@ -405,7 +653,7 @@ async fn simulate(
         };
         let process_received_user_request = |mut user_request: UserRequest, library: &mut Library,
                 requests_count: &Vec<u32>, dbs: &Vec<Database>, waiting_stat: &mut HashMap<_, _>| {
-            user_request.received_at = Some(time::Instant::now());
+            user_request.received_at = Some(MyTime::Instant(time::Instant::now()));
             if input_intensity.is_none() {
                 // Means we want to test the maximum system throughput, thus it
                 // makes sense to (re)set the creation_time as the reception_time (now),
@@ -415,7 +663,7 @@ async fn simulate(
                 // be equal both when calculating the actual value (processed amount
                 // divided by time taken) and when calculating the theoretical value
                 // (using average request processing time).
-                user_request.created_at = time::Instant::now();
+                user_request.created_at = MyTime::Instant(time::Instant::now());
             }
             // ================================================================
             // A new User?
@@ -443,15 +691,15 @@ async fn simulate(
             let t = scope.spawn(move |_| {
                 while let Some((counter_tx, db, chosen_worker)) = rx.recv().expect("broken thread pipe rx") {
                     // Process here
-                    let ping_lasted = if let Some(client) = &db.client {
+                    let ping_lasted = MyDuration::Timed(if let Some(client) = &db.client {
                         block_on(ping(&client)).expect("failed ping")
                     } else {
                         let duration = time::Duration::from_millis(db.ping_millis as u64);
                         crossbeam::channel::after(duration).recv().unwrap();
                         duration
-                    };
+                    });
 
-                    let finish = time::Instant::now();
+                    let finish = MyTime::Instant(time::Instant::now());
                     // Report that this worker has finished and is free now
                     let worker_result = (chosen_worker, finish, ping_lasted);
                     counter_tx.send(worker_result).expect("broken channel");
@@ -506,21 +754,6 @@ async fn simulate(
                 processed_user_requests.push(user_request);
             }
 
-
-            // let gonna = queue.iter().any(|user_request| {
-            //     let able_worker_ids = &library.dbs_for_user[&user_request.user_id];
-            //     workers.iter().enumerate()
-            //         .any(|(i, req)| req.is_none() && able_worker_ids.contains(&i))
-            // });
-            // if gonna {
-            //     println!("Available workers = {:?}", workers.iter().enumerate().filter(|(_,w)| w.is_none()).map(|(i,_)| i).collect::<Vec<_>>());
-            //     print!("There are {} requests in queue:", queue.len());
-            //     for UserRequest{id, user_id, ..} in queue.iter() {
-            //         print!("[{} from {}], ", id, user_id);
-            //     }
-            //     println!();
-            // }
-
             // For each UserRequest...
             let task = queue.iter() // NOTE: to make this a simple queue without look-through just .take(1)
                 // ... get its able_worker_ids ...
@@ -546,7 +779,7 @@ async fn simulate(
 
                 // ================================================================
                 // println!("Choosing worker {}", chosen_worker);
-                user_request.assigned_at = Some(time::Instant::now());
+                user_request.assigned_at = Some(MyTime::Instant(time::Instant::now()));
                 user_request.processed_at_worker = Some(chosen_worker);
                 user_request.processed_at_iteration = iteration - 1;
                 requests_count_of_worker[chosen_worker] += 1;
@@ -554,7 +787,7 @@ async fn simulate(
                 // Update WaitingStat required for making decisions
                 let user_id = user_request.user_id;
                 let stat: &mut WaitingStat = waiting_stat_for_user.get_mut(&user_id).expect("unregistered user");
-                let waiting_time = user_request.assigned_at.unwrap().duration_since(user_request.created_at).as_millis();
+                let waiting_time = user_request.assigned_at.unwrap().duration_since(&user_request.created_at).as_millis();
                 let delta = waiting_time as Delta - stat.last_waiting_time as Delta;
                 stat.last_waiting_time = waiting_time;
                 stat.put(delta);
@@ -596,7 +829,7 @@ async fn simulate(
     let simulation_duration = simulation_start.elapsed();
     println!();
 
-    Ok(SimulationOutput{ start: simulation_start, duration: simulation_duration, processed_user_requests,
+    Ok(SimulationOutput{ start: MyTime::Instant(simulation_start), duration: MyDuration::Timed(simulation_duration), processed_user_requests,
         dbs_for_user: library.dbs_for_user,
         average_db_ping_millis: dbs.iter().map(|db| db.ping_millis).collect::<Vec<_>>() })
 }
@@ -734,7 +967,7 @@ fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &
     println!();
 }
 
-fn describe_simulation_output(SimulationOutput{ start, duration, processed_user_requests, dbs_for_user, average_db_ping_millis }: &SimulationOutput) {
+fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_user_requests, dbs_for_user, average_db_ping_millis }: &SimulationOutput) {
     /*
      * The (assigned_at - received_at) time generally can never be greater than
      * the waiting time for the fastest worker, so this metric is useless as a
@@ -751,8 +984,8 @@ fn describe_simulation_output(SimulationOutput{ start, duration, processed_user_
         let ping_lasted =         ping_lasted        .expect("empty Option while describing processed request");
         let processed_at_worker = processed_at_worker.expect("empty Option while describing processed request");
 
-        let waiting_time = assigned_at.duration_since(*created_at).as_millis();
-        let total_time   = finished_at.duration_since(received_at).as_millis();
+        let waiting_time = assigned_at.duration_since(&*created_at).as_millis();
+        let total_time   = finished_at.duration_since(&received_at).as_millis();
         average_total_time   += total_time;
         average_waiting_time += waiting_time;
         // waiting_times_bad.push(waiting_time);
@@ -782,7 +1015,7 @@ fn describe_simulation_output(SimulationOutput{ start, duration, processed_user_
     let mut per_user_spread_iteration = Vec::new();
     for UserRequest{ user_id, created_at, assigned_at, id, processed_at_iteration, triggered_spread, .. } in processed_user_requests {
         let assigned_at = assigned_at.expect("empty Option while describing processed request");
-        let waiting_time = assigned_at.duration_since(*created_at).as_millis();
+        let waiting_time = assigned_at.duration_since(&*created_at).as_millis();
         waiting_times_by_id[*id as usize] = waiting_time;
         waiting_times_by_iteration[*processed_at_iteration] = waiting_time;
 
@@ -832,7 +1065,7 @@ fn describe_simulation_output(SimulationOutput{ start, duration, processed_user_
 
     // Generate charts
     draw_chart(waiting_times_by_id, Some(&spread_moments_by_id), "Waiting times by id", "request id", "waiting time").expect("Unable to build chart");
-    draw_chart(waiting_times_by_iteration, Some(&spread_moments_by_iteration), "Waiting times by iteration", "iteration", "waiting time").expect("Unable to build chart");
+    // draw_chart(waiting_times_by_iteration, Some(&spread_moments_by_iteration), "Waiting times by iteration", "iteration", "waiting time").expect("Unable to build chart");
     // for (i, times_for_user) in per_user_waiting_times_id.into_iter().enumerate() {
     //     draw_chart(times_for_user, Some(&per_user_spread_id[i]), &format!("Waiting times by id for user {}", i), "request id", "waiting time").expect("Unable to build chart");
     // }
@@ -840,9 +1073,9 @@ fn describe_simulation_output(SimulationOutput{ start, duration, processed_user_
     //     draw_chart(times_for_user, Some(&per_user_spread_iteration[i]), &format!("Waiting times by iteration for user {}", i), "iteration", "waiting time").expect("Unable to build chart");
     // }
 
-    for UserRequest{ created_at, received_at, id, .. } in processed_user_requests {
-        println!("[{}] Created = {}, Received = {}", id, created_at.duration_since(*start).as_micros(), received_at.unwrap().duration_since(*start).as_micros());
-    }
+    // for UserRequest{ created_at, received_at, id, .. } in processed_user_requests {
+    //     println!("[{}] Created = {}, Received = {}", id, created_at.duration_since(&*start).as_micros(), received_at.unwrap().duration_since(&*start).as_micros());
+    // }
 
     println!();
 }
@@ -900,6 +1133,7 @@ async fn main() -> MongoResult<()> {
     describe_simulation_hyperparameters(&hyperparameters);
 
     let output = simulate(random, parameters, hyperparameters).await?;
+    // let output = simulate_fake(random, parameters, hyperparameters);
 
     describe_simulation_output(&output);
 
