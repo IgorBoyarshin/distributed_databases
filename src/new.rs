@@ -211,21 +211,21 @@ impl MyDuration {
     fn as_secs(&self) -> u128 {
         match self {
             MyDuration::Timed(duration) => duration.as_secs() as u128,
-            MyDuration::Iterated(micros) => micros / 1_000_000,
+            MyDuration::Iterated(nanos) => nanos / 1_000_000_000,
         }
     }
 
     fn as_millis(&self) -> u128 {
         match self {
             MyDuration::Timed(duration) => duration.as_millis(),
-            MyDuration::Iterated(micros) => micros / 1_000,
+            MyDuration::Iterated(nanos) => nanos / 1_000_000,
         }
     }
 
     fn as_micros(&self) -> u128 {
         match self {
             MyDuration::Timed(duration) => duration.as_micros(),
-            MyDuration::Iterated(micros) => *micros,
+            MyDuration::Iterated(nanos) => nanos / 1_000,
         }
     }
 }
@@ -424,10 +424,10 @@ fn simulate_fake(
     let mut spawn_wake_at = 0;
 
     'simulation_loop: loop {
-        println!(":> Woke at iteration {} with processed len = {}", iteration, processed_user_requests.len());
+        println!(":> Woke at iteration {} with processed count = {}", iteration, processed_user_requests.len());
         // Spawn UserRequests
         if iteration == spawn_wake_at && !spawning_done {
-            println!(":> .... to spawn some!");
+            // println!(":> .... to spawn some!");
             'spawning_loop: loop { // loop is used to make instant multi-spawning possible
                 // Pick random user
                 let len = users.len();
@@ -459,11 +459,11 @@ fn simulate_fake(
                 if let Some(input_intensity) = input_intensity {
                     // Go to sleep
                     let sleep_duration = -random.sample::<f32, _>(Open01).ln() / input_intensity;
-                    let micros_in_second = 1_000_000.0;
-                    let sleep_micros = (micros_in_second * sleep_duration) as u64;
-                    // println!("Sleeping for {} micros", sleep_micros as u64);
+                    let nanos_in_second = 1_000_000_000.0;
+                    let sleep_nanos = (nanos_in_second * sleep_duration) as u64;
+                    println!("Sleeping for {} nanos", sleep_nanos as u64);
 
-                    spawn_wake_at = iteration + sleep_micros as u128;
+                    spawn_wake_at = iteration + sleep_nanos as u128;
                     break 'spawning_loop;
                 }
             }
@@ -485,7 +485,7 @@ fn simulate_fake(
             }
         }
         if freed {
-            println!(":> .... to free some!");
+            // println!(":> .... to free some!");
         }
 
 
@@ -508,7 +508,7 @@ fn simulate_fake(
             .next()
             .map(|(i, w)| (i, w.unwrap())); // checked that it is Option::Some earlier
         if let Some((user_request_i, chosen_worker)) = task {
-            println!(":> .... to assign some!");
+            // println!(":> .... to assign some!");
             let mut user_request = queue.remove(user_request_i);
             println!("Processing number [{}] with queue of {}", processing_number, queue.len());
             processing_number += 1;
@@ -538,19 +538,21 @@ fn simulate_fake(
                     library.spread_user_to(user_id, new_db_id);
                     user_request.triggered_spread = true;
                     println!("Spreading user {} to {}", user_id, new_db_id);
+                    // println!("... because deltas are {:?}", stat.deltas);
                 } else {
                     println!("Nowhere to spread {}", user_id);
                 }
             }
+            println!("... because deltas are {:?}", stat.deltas);
 
             // ================================================================
             // Launch processing thread
             let db = &dbs[chosen_worker];
-            let sleep_micros = db.ping_millis * 1000;
-            user_request.ping_lasted = Some(MyDuration::Iterated(sleep_micros));
+            let sleep_nanos = db.ping_millis * 1_000_000;
+            user_request.ping_lasted = Some(MyDuration::Iterated(sleep_nanos));
             // Mark Worker as busy
             workers[chosen_worker] = Some(user_request);
-            pending_workers[chosen_worker] = iteration + sleep_micros;
+            pending_workers[chosen_worker] = iteration + sleep_nanos;
         }
 
         // ======================== Finish simulation? ========================
@@ -905,14 +907,14 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
     } else {
         println!(":> Performing fake simulation");
         vec![
-            // (262, "Christmas Tree"), // 262
-            // (71, "Orange Tree"), // 71
-            // (131, "Lemon Tree"), // 131
-            // (41, "Maple Tree") // 41
-            (52, "Christmas Tree"), // 262
-            (14, "Orange Tree"), // 71
-            (26, "Lemon Tree"), // 131
-            (8, "Maple Tree") // 41
+            // XXX
+            // XXX Increasing the time leads to improved accuracy.
+            // XXX Numbers starting from 1000 up should be sufficient.
+            // XXX
+            (1_000 * 61, "Christmas Tree"), // 262
+            (1_000 * 13, "Orange Tree"), // 71
+            (1_000 * 23, "Lemon Tree"), // 131
+            (1_000 * 7, "Maple Tree") // 41
         ].into_iter()
         .map(|(ping, name)| Database { client: None, name: name, ping_millis: ping })
         .collect()
@@ -943,7 +945,7 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 2 * 512,
+        request_amount: 8 * 512,
         // input_intensity: None,
         input_intensity: Some(0.9 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -1125,15 +1127,15 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 // ============================================================================
 #[tokio::main]
 async fn main() -> MongoResult<()> {
-    let mut random = ChaChaRng::seed_from_u64(314);
+    let mut random = ChaChaRng::seed_from_u64(315);
 
     let hyperparameters = get_hyperparameters(&mut random, false).await?;
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
 
-    let output = simulate(random, parameters, hyperparameters).await?;
-    // let output = simulate_fake(random, parameters, hyperparameters);
+    // let output = simulate(random, parameters, hyperparameters).await?;
+    let output = simulate_fake(random, parameters, hyperparameters);
 
     describe_simulation_output(&output);
 
