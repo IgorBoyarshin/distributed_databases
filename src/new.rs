@@ -911,10 +911,14 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
             // XXX Increasing the time leads to improved accuracy.
             // XXX Numbers starting from 1000 up should be sufficient.
             // XXX
-            (1_000 * 61, "Christmas Tree"), // 262
-            (1_000 * 13, "Orange Tree"), // 71
-            (1_000 * 23, "Lemon Tree"), // 131
-            (1_000 * 7, "Maple Tree") // 41
+            (1_000 * 262, "Christmas Tree"), // 262
+            (1_000 * 71, "Orange Tree"), // 71
+            (1_000 * 131, "Lemon Tree"), // 131
+            (1_000 * 41, "Maple Tree") // 41
+            // (1_000 * 61, "Christmas Tree"), // 262
+            // (1_000 * 13, "Orange Tree"), // 71
+            // (1_000 * 23, "Lemon Tree"), // 131
+            // (1_000 * 7, "Maple Tree") // 41
         ].into_iter()
         .map(|(ping, name)| Database { client: None, name: name, ping_millis: ping })
         .collect()
@@ -945,7 +949,7 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 8 * 512,
+        request_amount: 16 * 512,
         // input_intensity: None,
         input_intensity: Some(0.9 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -1127,15 +1131,20 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 // ============================================================================
 #[tokio::main]
 async fn main() -> MongoResult<()> {
+    let simulation_is_real = false;
+
     let mut random = ChaChaRng::seed_from_u64(315);
 
-    let hyperparameters = get_hyperparameters(&mut random, false).await?;
+    let hyperparameters = get_hyperparameters(&mut random, simulation_is_real).await?;
     let parameters = get_parameters();
 
     describe_simulation_hyperparameters(&hyperparameters);
 
-    // let output = simulate(random, parameters, hyperparameters).await?;
-    let output = simulate_fake(random, parameters, hyperparameters);
+    let output = if simulation_is_real {
+        simulate(random, parameters, hyperparameters).await?
+    } else {
+        simulate_fake(random, parameters, hyperparameters)
+    };
 
     describe_simulation_output(&output);
 
