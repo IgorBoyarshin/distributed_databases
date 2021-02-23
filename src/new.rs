@@ -427,7 +427,7 @@ fn simulate_fake(
     let mut spawn_wake_at = 0;
 
     'simulation_loop: loop {
-        println!(":> Woke at iteration {} with processed count = {}", iteration, processed_user_requests.len());
+        // println!(":> Woke at iteration {} with processed count = {}", iteration, processed_user_requests.len());
         // Spawn UserRequests
         if iteration == spawn_wake_at && !spawning_done {
             // println!(":> .... to spawn some!");
@@ -465,7 +465,7 @@ fn simulate_fake(
                     let sleep_duration = 1.0 / input_intensity;
                     let nanos_in_second = 1_000_000_000.0;
                     let sleep_nanos = (nanos_in_second * sleep_duration) as u64;
-                    println!("Sleeping for {} nanos", sleep_nanos as u64);
+                    // println!("Sleeping for {} nanos", sleep_nanos as u64);
 
                     spawn_wake_at = iteration + sleep_nanos as u128;
                     break 'spawning_loop;
@@ -508,7 +508,7 @@ fn simulate_fake(
         if let Some((user_request_i, chosen_worker)) = task {
             // println!(":> .... to assign some!");
             let mut user_request = queue.remove(user_request_i);
-            println!("Processing number [{}] with queue of {}", processing_number, queue.len());
+            // println!("Processing number [{}] with queue of {}", processing_number, queue.len());
             processing_number += 1;
 
             // ================================================================
@@ -913,10 +913,10 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
             (1_000 * 41, "Maple Tree"), // 41
 
             (1_000 * 31, "Maple Tree 2"), // 41
-            (1_000 * 21, "Maple Tree 3"), // 41
-            (1_000 * 45, "Maple Tree 4"), // 41
-            (1_000 * 91, "Maple Tree 5"), // 41
-            (1_000 * 141, "Maple Tree 6"), // 41
+            (1_000 * 121, "Maple Tree 3"), // 41
+            (1_000 * 95, "Maple Tree 4"), // 41
+            // (1_000 * 91, "Maple Tree 5"), // 41
+            // (1_000 * 141, "Maple Tree 6"), // 41
             // (1_000 * 61, "Christmas Tree"), // 262
             // (1_000 * 13, "Orange Tree"), // 71
             // (1_000 * 23, "Lemon Tree"), // 131
@@ -934,7 +934,7 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
     // Users are created here and not inside simulation based on hyperparameters
     // because there is an element of random in creation (e.g. Behavior), and
     // we would like all simulation to be conducted with the same set of users.
-    let users = User::create_users(random, 5, projects_count, projects_per_user);
+    let users = User::create_users(random, 10, projects_count, projects_per_user);
 
 
     println!(":> Sorting DBs based on ping");
@@ -970,9 +970,11 @@ fn get_parameters() -> SimulationParameters {
     }
 }
 
-fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, .. }: &SimulationHyperParameters) {
+fn describe_simulation_hyperparameters(SimulationHyperParameters{ users, project_names, .. }: &SimulationHyperParameters) {
     println!(":> Users:");
     for user in users.iter() { describe_user(&user); }
+
+    println!("Total count of project units: {}", project_names.len() * users[0].project_ids.len());
     println!();
 }
 
@@ -986,11 +988,12 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
     let mut average_total_time = 0;
     let mut average_waiting_time = 0;
     let mut worker_usage_count = Vec::new(); // empirically determines the amount of Workers
-    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, project_id, .. } in processed_user_requests {
+    // for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted, id, user_id, project_id, .. } in processed_user_requests {
+    for UserRequest{ created_at, received_at, assigned_at, finished_at, processed_at_worker, ping_lasted: _, id: _, user_id: _, project_id: _, .. } in processed_user_requests {
         let received_at =         received_at        .expect("empty Option while describing processed request");
         let assigned_at =         assigned_at        .expect("empty Option while describing processed request");
         let finished_at =         finished_at        .expect("empty Option while describing processed request");
-        let ping_lasted =         ping_lasted        .expect("empty Option while describing processed request");
+        // let ping_lasted =         ping_lasted        .expect("empty Option while describing processed request");
         let processed_at_worker = processed_at_worker.expect("empty Option while describing processed request");
 
         let waiting_time = assigned_at.duration_since(&*created_at).as_millis();
@@ -999,15 +1002,15 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
         average_waiting_time += waiting_time;
         // waiting_times_bad.push(waiting_time);
 
-        println!("Request [{:>4}] with project {:>2} from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
-            id,
-            project_id,
-            "#".repeat(*user_id as usize),
-            waiting_time,
-            total_time,
-            processed_at_worker,
-            ping_lasted.as_millis(),
-        );
+        // println!("Request [{:>4}] with project {:>2} from {:>7} waited for {:>7} millis, processed in {:>8} millis, processed at {}, ping lasted {}ms",
+        //     id,
+        //     project_id,
+        //     "#".repeat(*user_id as usize),
+        //     waiting_time,
+        //     total_time,
+        //     processed_at_worker,
+        //     ping_lasted.as_millis(),
+        // );
 
         while processed_at_worker >= worker_usage_count.len() {
             worker_usage_count.push(0);
@@ -1071,6 +1074,7 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
             }
             res
         }).collect::<Vec<_>>();
+    println!(":> Total project units stored: {}", projects_for_db.iter().map(|v| v.iter().count()).sum::<usize>());
     println!(":> Database usage by projects: {:?}", projects_for_db);
 
     // Generate charts
