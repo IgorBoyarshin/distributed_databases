@@ -382,9 +382,6 @@ impl WaitingStat {
     }
 }
 
-// NOTE
-// NOTE registration occurs on creation, data may be outdated
-// NOTE
 fn simulate_fake(
         mut random: ChaChaRng,
         SimulationParameters{ spread_rate: _, decay_rate: _ }: SimulationParameters,
@@ -952,7 +949,7 @@ async fn get_hyperparameters(random: &mut ChaChaRng, is_real: bool) -> MongoResu
         max_processing_intensity, (1000.0 / max_processing_intensity) as u32);
 
     Ok(SimulationHyperParameters {
-        request_amount: 8 * 512,
+        request_amount: 4 * 512,
         // input_intensity: None,
         input_intensity: Some(0.85 * max_processing_intensity),
         // input_intensity: Some(1.05 * processing_intensity),
@@ -1019,36 +1016,37 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
     }
 
     let mut waiting_times_by_id = vec![0; processed_user_requests.len()];
-    let mut waiting_times_by_iteration = vec![0; processed_user_requests.len()];
-    let mut per_user_waiting_times_id = Vec::new();
-    let mut per_user_waiting_times_iteration = Vec::new();
+    let mut per_project_waiting_times_id = Vec::new();
     let mut spread_moments_by_id = Vec::new();
+    let mut per_project_spread_id = Vec::new();
+
+    let mut waiting_times_by_iteration = vec![0; processed_user_requests.len()];
     let mut spread_moments_by_iteration = Vec::new();
-    let mut per_user_spread_id = Vec::new();
-    let mut per_user_spread_iteration = Vec::new();
-    for UserRequest{ user_id, created_at, assigned_at, id, processed_at_iteration, triggered_spread, .. } in processed_user_requests {
+    // let mut per_project_waiting_times_iteration = Vec::new();
+    // let mut per_project_spread_iteration = Vec::new();
+    for UserRequest{ project_id, user_id: _, created_at, assigned_at, id, processed_at_iteration, triggered_spread, .. } in processed_user_requests {
         let assigned_at = assigned_at.expect("empty Option while describing processed request");
-        let waiting_time = assigned_at.duration_since(&*created_at).as_millis();
+        let waiting_time = assigned_at.duration_since(&*created_at).as_millis() / 1000;
         waiting_times_by_id[*id as usize] = waiting_time;
         waiting_times_by_iteration[*processed_at_iteration] = waiting_time;
 
-        while *user_id as usize >= per_user_waiting_times_id.len() {
-            per_user_waiting_times_id.push(vec![0; processed_user_requests.len()]);
-            per_user_spread_id.push(Vec::new());
+        while *project_id as usize >= per_project_waiting_times_id.len() {
+            per_project_waiting_times_id.push(vec![None; processed_user_requests.len()]);
+            per_project_spread_id.push(Vec::new());
         }
-        per_user_waiting_times_id[*user_id as usize][*id as usize] = waiting_time;
+        per_project_waiting_times_id[*project_id as usize][*id as usize] = Some(waiting_time);
 
-        while *user_id as usize >= per_user_waiting_times_iteration.len() {
-            per_user_waiting_times_iteration.push(vec![0; processed_user_requests.len()]);
-            per_user_spread_iteration.push(Vec::new());
-        }
-        per_user_waiting_times_iteration[*user_id as usize][*processed_at_iteration] = waiting_time;
+        // while *project_id as usize >= per_project_waiting_times_iteration.len() {
+        //     per_project_waiting_times_iteration.push(vec![0; processed_user_requests.len()]);
+        //     per_project_spread_iteration.push(Vec::new());
+        // }
+        // per_project_waiting_times_iteration[*project_id as usize][*processed_at_iteration] = waiting_time;
 
         if *triggered_spread {
             spread_moments_by_id.push(*id as u128);
+            per_project_spread_id[*project_id as usize].push(*id as u128);
             spread_moments_by_iteration.push(*processed_at_iteration as u128);
-            per_user_spread_iteration[*user_id as usize].push(*processed_at_iteration as u128);
-            per_user_spread_id[*user_id as usize].push(*id as u128);
+            // per_project_spread_iteration[*project_id as usize].push(*processed_at_iteration as u128);
         }
     }
 
@@ -1078,11 +1076,12 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
     println!(":> Database usage by projects: {:?}", projects_for_db);
 
     // Generate charts
-    draw_chart(waiting_times_by_id, Some(&spread_moments_by_id), "Waiting times by id", "request id", "waiting time").expect("Unable to build chart");
-    // draw_chart(waiting_times_by_iteration, Some(&spread_moments_by_iteration), "Waiting times by iteration", "iteration", "waiting time").expect("Unable to build chart");
-    // for (i, times_for_user) in per_user_waiting_times_id.into_iter().enumerate() {
-    //     draw_chart(times_for_user, Some(&per_user_spread_id[i]), &format!("Waiting times by id for user {}", i), "request id", "waiting time").expect("Unable to build chart");
+    draw_chart(waiting_times_by_id, Some(&spread_moments_by_id), "Waiting times", "request id", "waiting time, ms").expect("Unable to build chart");
+    // for (i, times_for_project) in per_project_waiting_times_id.into_iter().enumerate() {
+    //     draw_chart_custom(times_for_project, Some(&per_project_spread_id[i]), &format!("Waiting times for project {}", i), "request id", "waiting time, ms").expect("Unable to build chart");
     // }
+
+    // draw_chart(waiting_times_by_iteration, Some(&spread_moments_by_iteration), "Waiting times by iteration", "iteration", "waiting time").expect("Unable to build chart");
     // for (i, times_for_user) in per_user_waiting_times_iteration.into_iter().enumerate() {
     //     draw_chart(times_for_user, Some(&per_user_spread_iteration[i]), &format!("Waiting times by iteration for user {}", i), "iteration", "waiting time").expect("Unable to build chart");
     // }
@@ -1092,6 +1091,58 @@ fn describe_simulation_output(SimulationOutput{ start: _, duration, processed_us
     // }
 
     println!();
+}
+
+fn draw_chart_custom(arr: Vec<Option<u128>>, marked: Option<&Vec<u128>>, name: &str, x_axis_name: &str, y_axis_name: &str) -> Option<()> {
+    use plotters::prelude::*;
+    const WIDTH: u32 = 1900;
+    const HEIGHT: u32 = 300;
+    let max_x = arr.len() as u128;
+    let max_y = arr.iter().map(|x| if let Some(x) = x { x } else { &0 }).max().unwrap() + 100;
+
+    let dots = arr.into_iter().enumerate()
+        .filter(|(_, x)| x.is_some())
+        .map(|(i, elem)| (i as u128, elem.unwrap()))
+        .collect::<Vec<_>>();
+
+    let mut camel = name.to_string().replace(" ", "_");
+    camel.make_ascii_lowercase();
+    let img_path = format!("{}.png", camel);
+    let root = BitMapBackend::new(&img_path, (WIDTH, HEIGHT)).into_drawing_area();
+    root.fill(&WHITE).ok()?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(name, ("sans-serif", 20).into_font())
+        .margin(10)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..max_x, 0..max_y).ok()?;
+
+    chart.configure_mesh()
+        .x_desc(x_axis_name)
+        .y_desc(y_axis_name)
+        .draw().ok()?;
+
+    chart.draw_series(LineSeries::new(
+            dots.iter().map(|(x, y)| (*x, *y)), &BLUE)).ok()?;
+
+    if let Some(moments) = marked {
+        for moment in moments.iter() {
+            chart.draw_series(LineSeries::new(vec![(*moment, 0), (*moment, max_y)], &RED)).ok()?;
+        }
+    }
+
+    chart.draw_series(PointSeries::of_element(
+            dots.iter().map(|(x, y)| (*x, *y)),
+            2,
+            &BLUE,
+            &|c, s, st| {
+                return EmptyElement::at(c)
+                    + Circle::new((0, 0), s, st.filled());
+            }
+    )).ok()?;
+
+    Some(())
 }
 
 fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_name: &str, y_axis_name: &str) -> Option<()> {
@@ -1141,7 +1192,7 @@ fn draw_chart(arr: Vec<u128>, marked: Option<&Vec<u128>>, name: &str, x_axis_nam
 async fn main() -> MongoResult<()> {
     let simulation_is_real = false;
 
-    let mut random = ChaChaRng::seed_from_u64(317);
+    let mut random = ChaChaRng::seed_from_u64(429);
 
     let hyperparameters = get_hyperparameters(&mut random, simulation_is_real).await?;
     let parameters = get_parameters();
